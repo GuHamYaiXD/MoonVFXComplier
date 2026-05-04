@@ -1,4 +1,4 @@
--- Auto-generated VFX Module by MeshEmitter Plugin
+-- Auto-generated VFX Module by VFXComplier Plugin
 -- Source: Bykaya cutt2
 
 local TweenService = game:GetService('TweenService')
