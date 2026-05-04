@@ -1,6 +1,3 @@
--- Made by @ErzT7 might not be that good :c
--- Upgraded with Generate VFX support for all instance types
--- Now with Animation & CameraRig cutscene support
 -- || Services || --
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local CollectionService = game:GetService("CollectionService")
