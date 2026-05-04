@@ -1,0 +1,10 @@
+{
+  "className": "ScreenGui",
+  "properties": {
+    "Attributes": {
+      "GroupType": "Vignette"
+    },
+    "ScreenInsets": "None",
+    "ZIndexBehavior": "Sibling"
+  }
+}

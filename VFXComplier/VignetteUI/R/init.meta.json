@@ -1,0 +1,15 @@
+{
+  "className": "ImageLabel",
+  "properties": {
+    "Attributes": {
+      "MeshEmitter": "[]"
+    },
+    "BackgroundColor3": [1, 1, 1],
+    "BackgroundTransparency": 1,
+    "ImageColor3": [0, 0, 0],
+    "ImageContent": "http://www.roblox.com/asset/?id=4764912960",
+    "ImageTransparency": 1,
+    "Size": [[1.0, 0.0], [1.0, 0.0]],
+    "ZIndex": -500
+  }
+}
