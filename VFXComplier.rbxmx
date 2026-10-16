@@ -17,7 +17,25 @@ local toolbar = plugin:CreateToolbar("MeshEmitter " .. string.gsub(script.Name, 
 
 local generateBtn = toolbar:CreateButton(
 	"Generate VFX",
-	"One-click: generate a complete VFX ModuleScript from MoonAnimator2 save files. Supports Beam, ParticleEmitter, Lights, Animations, CameraRig cutscenes.",
+	"One-click: generate a complete VFX ModuleScript from MoonAnimator2 save files or Eclipse Animator projects. Supports Beam, ParticleEmitter, Lights, Animations, CameraRig cutscenes.",
+	"rbxassetid://135308249378556"
+)
+
+local generateNoCutsceneBtn = toolbar:CreateButton(
+	"Generate VFX (No Cutscene)",
+	"Generate a world-only VFX ModuleScript: skips camera cutscene, FOV, Vignette/ScreenCover UI and Lighting effects.",
+	"rbxassetid://135308249378556"
+)
+
+local installPayloadBtn = toolbar:CreateButton(
+	"Get Module",
+	"Install/update the Payload libraries (VFXPayload utilities + universal VFX caller) next to your ForgeVFX module.",
+	"rbxassetid://135308249378556"
+)
+
+local settingsBtn = toolbar:CreateButton(
+	"Settings",
+	"Configure the ForgeVFX module location used by generated code and Install Payload.",
 	"rbxassetid://135308249378556"
 )
 
@@ -110,6 +128,14 @@ local function fixEaseStyle(style)
 	end
 end
 
+-- Helper: Roblox has no OutIn easing direction; InOut is the closest
+local function fixEaseDirection(direction)
+	if direction == "OutIn" then
+		return "InOut"
+	end
+	return direction
+end
+
 -- Helper: convert a Roblox value to its Lua code string representation
 local function valueToLuaCode(val, valClassName)
 	if valClassName == "CFrameValue" or typeof(val) == "CFrame" then
@@ -129,6 +155,8 @@ local function valueToLuaCode(val, valClassName)
 		return tostring(val)
 	elseif valClassName == "IntValue" then
 		return tostring(val)
+	elseif valClassName == "StringValue" or typeof(val) == "string" then
+		return string.format("%q", val)
 	end
 	return tostring(val)
 end
@@ -253,10 +281,1089 @@ local function hasAnimator(instance)
 	return false
 end
 
-generateBtn.Click:Connect(function()
+-- || Settings / Path helpers || --
+local SETTING_KEY = "MeshEmitter_ForgeVFXPath"
+local DEFAULT_FORGEVFX_PATH = "ReplicatedStorage.ForgeVFX"
+local STORAGE_SETTING_KEY = "MeshEmitter_VFXStoragePath"
+local DEFAULT_VFX_STORAGE_PATH = "ReplicatedStorage.VFX"
+
+local function getForgeVFXPath()
+	local saved = plugin:GetSetting(SETTING_KEY)
+	if type(saved) == "string" and saved ~= "" then
+		return saved
+	end
+	return DEFAULT_FORGEVFX_PATH
+end
+
+local function getVFXStoragePath()
+	local saved = plugin:GetSetting(STORAGE_SETTING_KEY)
+	if type(saved) == "string" and saved ~= "" then
+		return saved
+	end
+	return DEFAULT_VFX_STORAGE_PATH
+end
+
+-- "ReplicatedStorage.Modules.ForgeVFX" -> {"ReplicatedStorage", "Modules", "ForgeVFX"} or nil, err
+local function parseForgeVFXPath(pathStr)
+	local segments = string.split(pathStr, ".")
+	if #segments < 2 then
+		return nil, "Path needs at least Service.ModuleName (e.g. ReplicatedStorage.ForgeVFX)"
+	end
+	local okSvc = pcall(function()
+		return game:GetService(segments[1])
+	end)
+	if not okSvc then
+		return nil, "Unknown service: " .. tostring(segments[1])
+	end
+	return segments
+end
+
+-- Build a require-expression string for generated code, e.g.
+-- game:GetService("ReplicatedStorage"):WaitForChild("Modules"):WaitForChild("ForgeVFX")
+local function segmentsToRequireExpr(segments, lastIndex)
+	lastIndex = lastIndex or #segments
+	local expr = 'game:GetService("' .. segments[1] .. '")'
+	for i = 2, lastIndex do
+		expr = expr .. ':WaitForChild("' .. segments[i] .. '")'
+	end
+	return expr
+end
+
+-- Runtime lookup of the PARENT container of the ForgeVFX module (for Install Payload)
+local function resolveForgeVFXParent(segments)
+	local ok, current = pcall(function()
+		return game:GetService(segments[1])
+	end)
+	if not ok or not current then
+		return nil
+	end
+	for i = 2, #segments - 1 do
+		current = current:FindFirstChild(segments[i])
+		if not current then
+			return nil
+		end
+	end
+	return current
+end
+
+-- || Payload library source (installed by the Install Payload button) || --
+local PAYLOAD_SOURCE = table.concat({
+	"-- VFXPayload: shared runtime utilities for generated VFXPlayer modules",
+	"-- Installed by the MeshEmitter plugin. Re-run Install Payload to update.",
+	"local TweenService = game:GetService('TweenService')",
+	"",
+	"local module = {}",
+	"",
+	"function module.setProperty(obj, prop, val, delayTime)",
+	"\tif delayTime > 0 then",
+	"\t\ttask.delay(delayTime, function() if obj then obj[prop] = val end end)",
+	"\telse",
+	"\t\tif obj then obj[prop] = val end",
+	"\tend",
+	"end",
+	"",
+	"function module.tweenProperty(obj, prop, fromVal, toVal, delayTime, dur, style, dir)",
+	"\tlocal function go()",
+	"\t\tif not obj then return end",
+	"\t\tobj[prop] = fromVal",
+	"\t\tTweenService:Create(obj, TweenInfo.new(dur, Enum.EasingStyle[style], Enum.EasingDirection[dir]), {[prop] = toVal}):Play()",
+	"\tend",
+	"\tif delayTime > 0 then task.delay(delayTime, go) else go() end",
+	"end",
+	"",
+	"function module.playKeyframes(obj, prop, propType, keyframes, baseRoot)",
+	"\tfor i = 1, #keyframes do",
+	"\t\tlocal kf = keyframes[i]",
+	"\t\tlocal nextKf = keyframes[i + 1]",
+	"\t\tlocal t, v, style, dir = kf[1], kf[2], kf[3], kf[4]",
+	"\t\tif not nextKf then",
+	"\t\t\tmodule.setProperty(obj, prop, v, t)",
+	"\t\t\tbreak",
+	"\t\tend",
+	"\t\tlocal t2, v2 = nextKf[1], nextKf[2]",
+	"\t\tlocal dur = math.max(0.001, t2 - t)",
+	"\t\tlocal info = TweenInfo.new(dur, Enum.EasingStyle[style], Enum.EasingDirection[dir])",
+	"\t\tlocal function go()",
+	"\t\t\tif not obj then return end",
+	"\t\t\tif propType == 'boolean' then",
+	"\t\t\t\tobj[prop] = v",
+	"\t\t\telseif propType == 'NumberSequence' then",
+	"\t\t\t\tlocal nv = Instance.new('NumberValue'); nv.Value = v",
+	"\t\t\t\tnv.Changed:Connect(function(val) if obj then obj[prop] = NumberSequence.new({NumberSequenceKeypoint.new(0, val), NumberSequenceKeypoint.new(1, val)}) end end)",
+	"\t\t\t\tlocal tw = TweenService:Create(nv, info, {Value = v2})",
+	"\t\t\t\ttw.Completed:Once(function() nv:Destroy() end); tw:Play()",
+	"\t\t\telseif propType == 'ColorSequence' then",
+	"\t\t\t\tlocal cv = Instance.new('Color3Value'); cv.Value = v",
+	"\t\t\t\tcv.Changed:Connect(function(val) if obj then obj[prop] = ColorSequence.new(val) end end)",
+	"\t\t\t\tlocal tw = TweenService:Create(cv, info, {Value = v2})",
+	"\t\t\t\ttw.Completed:Once(function() cv:Destroy() end); tw:Play()",
+	"\t\t\telseif propType == 'RelCFrame' then",
+	"\t\t\t\tif baseRoot then",
+	"\t\t\t\t\tlocal nv = Instance.new('NumberValue'); nv.Value = 0; local conn",
+	"\t\t\t\t\tconn = nv.Changed:Connect(function(a) if obj and baseRoot then obj.CFrame = baseRoot.CFrame * v:Lerp(v2, a) end end)",
+	"\t\t\t\t\tlocal tw = TweenService:Create(nv, info, {Value = 1})",
+	"\t\t\t\t\ttw.Completed:Once(function() conn:Disconnect() nv:Destroy() end); tw:Play()",
+	"\t\t\t\tend",
+	"\t\t\telse",
+	"\t\t\t\tobj[prop] = v",
+	"\t\t\t\tTweenService:Create(obj, info, {[prop] = v2}):Play()",
+	"\t\t\tend",
+	"\t\tend",
+	"\t\tif t > 0 then task.delay(t, go) else go() end",
+	"\tend",
+	"end",
+	"",
+	"function module.safeEmit(instance, count)",
+	"\tif instance and instance:IsA('ParticleEmitter') then instance:Emit(count) end",
+	"end",
+	"",
+	"return module",
+}, "\n")
+
+-- || Universal VFX caller module source (storage path baked in at install time) || --
+local function buildVFXSource(storageSegments)
+	local fullPath = table.concat(storageSegments, ".")
+	local lines = {}
+	local function add(line)
+		lines[#lines + 1] = line
+	end
+	add("-- VFX: universal caller for plugin-generated VFXPlayer modules")
+	add("-- Installed by the MeshEmitter plugin. Re-run Get Module to update.")
+	add("local module = {}")
+	add("")
+	add("local function getStorage()")
+	add('\tlocal current = game:GetService("' .. storageSegments[1] .. '")')
+	for i = 2, #storageSegments do
+		add('\tcurrent = current and current:FindFirstChild("' .. storageSegments[i] .. '")')
+	end
+	add("\treturn current")
+	add("end")
+	add("")
+	add("local function resolvePlayer(target)")
+	add("\tif typeof(target) == 'string' then")
+	add("\t\tlocal storage = getStorage()")
+	add("\t\tif not storage then")
+	add('\t\t\twarn("[VFX] Storage folder not found (' .. fullPath .. '). Check plugin Settings.")')
+	add("\t\t\treturn nil")
+	add("\t\tend")
+	add("\t\tlocal found = storage:FindFirstChild(target) or storage:FindFirstChild(target .. '_VFX')")
+	add("\t\tif not found then")
+	add("\t\t\twarn(\"[VFX] No VFX named '\" .. target .. \"' in \" .. storage:GetFullName())")
+	add("\t\t\treturn nil")
+	add("\t\tend")
+	add("\t\ttarget = found")
+	add("\tend")
+	add("\tif typeof(target) ~= 'Instance' then")
+	add("\t\treturn nil")
+	add("\tend")
+	add("\tif target:IsA('ModuleScript') then")
+	add("\t\treturn target")
+	add("\tend")
+	add("\tlocal player = target:FindFirstChild('VFXPlayer')")
+	add("\tif player then")
+	add("\t\treturn player")
+	add("\tend")
+	add("\twarn('[VFX] No VFXPlayer module inside: ' .. target:GetFullName())")
+	add("\treturn nil")
+	add("end")
+	add("")
+	add("-- Returns the required VFXPlayer table for a name / model / ModuleScript (or nil)")
+	add("function module.Get(target)")
+	add("\tlocal player = resolvePlayer(target)")
+	add("\tif not player then")
+	add("\t\treturn nil")
+	add("\tend")
+	add("\treturn require(player)")
+	add("end")
+	add("")
+	add("-- Universal play: VFX.Play('Slash' or model, rootPart, offset, lifeTime, config)")
+	add("function module.Play(target, rootPart, offset, lifeTime, config)")
+	add("\tlocal vfx = module.Get(target)")
+	add("\tif not vfx then")
+	add("\t\treturn nil")
+	add("\tend")
+	add("\treturn vfx.Play(rootPart, offset, lifeTime, config)")
+	add("end")
+	add("")
+	add("return module")
+	return table.concat(lines, "\n")
+end
+
+installPayloadBtn.Click:Connect(function()
+	local segments, err = parseForgeVFXPath(getForgeVFXPath())
+	if not segments then
+		warn(">> [InstallPayload] Invalid ForgeVFX path setting: " .. tostring(err))
+		return
+	end
+	local parent = resolveForgeVFXParent(segments)
+	if not parent then
+		warn(">> [InstallPayload] Could not resolve parent of: " .. getForgeVFXPath() .. " - create the folder chain first or fix Settings.")
+		return
+	end
+
+	local recording = ChangeHistoryService:TryBeginRecording("MeshEmitter Install Payload")
+
+	local payloadFolder = parent:FindFirstChild("Payload")
+	if not payloadFolder or not payloadFolder:IsA("Folder") then
+		payloadFolder = Instance.new("Folder")
+		payloadFolder.Name = "Payload"
+		payloadFolder.Parent = parent
+	end
+	local mod = payloadFolder:FindFirstChild("VFXPayload")
+	if not mod or not mod:IsA("ModuleScript") then
+		mod = Instance.new("ModuleScript")
+		mod.Name = "VFXPayload"
+		mod.Parent = payloadFolder
+	end
+	mod.Source = PAYLOAD_SOURCE
+
+	local storageSegments = parseForgeVFXPath(getVFXStoragePath()) or string.split(DEFAULT_VFX_STORAGE_PATH, ".")
+	local vfxMod = payloadFolder:FindFirstChild("VFX")
+	if not vfxMod or not vfxMod:IsA("ModuleScript") then
+		vfxMod = Instance.new("ModuleScript")
+		vfxMod.Name = "VFX"
+		vfxMod.Parent = payloadFolder
+	end
+	vfxMod.Source = buildVFXSource(storageSegments)
+
+	if recording then
+		ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
+	end
+	print(">> [GetModule] Installed/updated VFXPayload + VFX in", payloadFolder:GetFullName())
+	Selection:Set({ vfxMod })
+end)
+
+-- || Settings widget || --
+local settingsWidget = plugin:CreateDockWidgetPluginGui(
+	"MeshEmitterSettings",
+	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 340, 215, 300, 195)
+)
+settingsWidget.Title = "MeshEmitter Settings"
+
+local settingsFrame = Instance.new("Frame")
+settingsFrame.Size = UDim2.new(1, 0, 1, 0)
+settingsFrame.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+settingsFrame.BorderSizePixel = 0
+settingsFrame.Parent = settingsWidget
+
+local pathLabel = Instance.new("TextLabel")
+pathLabel.Size = UDim2.new(1, -20, 0, 20)
+pathLabel.Position = UDim2.new(0, 10, 0, 10)
+pathLabel.Text = "ForgeVFX module path (Service.Child.ModuleName):"
+pathLabel.TextColor3 = Color3.new(1, 1, 1)
+pathLabel.TextXAlignment = Enum.TextXAlignment.Left
+pathLabel.Font = Enum.Font.GothamBold
+pathLabel.TextSize = 13
+pathLabel.BackgroundTransparency = 1
+pathLabel.Parent = settingsFrame
+
+local pathBox = Instance.new("TextBox")
+pathBox.Size = UDim2.new(1, -20, 0, 30)
+pathBox.Position = UDim2.new(0, 10, 0, 35)
+pathBox.Text = getForgeVFXPath()
+pathBox.ClearTextOnFocus = false
+pathBox.TextColor3 = Color3.new(1, 1, 1)
+pathBox.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+pathBox.Font = Enum.Font.Code
+pathBox.TextSize = 14
+pathBox.TextXAlignment = Enum.TextXAlignment.Left
+pathBox.Parent = settingsFrame
+local uiPathBox = Instance.new("UICorner", pathBox)
+
+local storageLabel = Instance.new("TextLabel")
+storageLabel.Size = UDim2.new(1, -20, 0, 20)
+storageLabel.Position = UDim2.new(0, 10, 0, 72)
+storageLabel.Text = "VFX storage folder (for VFX.Play by name):"
+storageLabel.TextColor3 = Color3.new(1, 1, 1)
+storageLabel.TextXAlignment = Enum.TextXAlignment.Left
+storageLabel.Font = Enum.Font.GothamBold
+storageLabel.TextSize = 13
+storageLabel.BackgroundTransparency = 1
+storageLabel.Parent = settingsFrame
+
+local storageBox = Instance.new("TextBox")
+storageBox.Size = UDim2.new(1, -20, 0, 30)
+storageBox.Position = UDim2.new(0, 10, 0, 95)
+storageBox.Text = getVFXStoragePath()
+storageBox.ClearTextOnFocus = false
+storageBox.TextColor3 = Color3.new(1, 1, 1)
+storageBox.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+storageBox.Font = Enum.Font.Code
+storageBox.TextSize = 14
+storageBox.TextXAlignment = Enum.TextXAlignment.Left
+storageBox.Parent = settingsFrame
+local uiStorageBox = Instance.new("UICorner", storageBox)
+
+local saveButton = Instance.new("TextButton")
+saveButton.Size = UDim2.new(0, 100, 0, 28)
+saveButton.Position = UDim2.new(0, 10, 0, 135)
+saveButton.Text = "Save"
+saveButton.Font = Enum.Font.GothamBold
+saveButton.TextSize = 16
+saveButton.TextColor3 = Color3.new(1, 1, 1)
+saveButton.BackgroundColor3 = Color3.fromRGB(40, 160, 70)
+saveButton.Parent = settingsFrame
+local uiSaveBtn = Instance.new("UICorner", saveButton)
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(1, -20, 0, 20)
+statusLabel.Position = UDim2.new(0, 10, 0, 168)
+statusLabel.Text = ""
+statusLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 13
+statusLabel.BackgroundTransparency = 1
+statusLabel.Parent = settingsFrame
+
+saveButton.MouseButton1Click:Connect(function()
+	local forgeText = pathBox.Text
+	local segments, err = parseForgeVFXPath(forgeText)
+	if not segments then
+		statusLabel.Text = "Invalid ForgeVFX path: " .. tostring(err)
+		return
+	end
+	local storageText = storageBox.Text
+	local storageSegments, storageErr = parseForgeVFXPath(storageText)
+	if not storageSegments then
+		statusLabel.Text = "Invalid storage path: " .. tostring(storageErr)
+		return
+	end
+	plugin:SetSetting(SETTING_KEY, forgeText)
+	plugin:SetSetting(STORAGE_SETTING_KEY, storageText)
+	statusLabel.Text = "Saved both paths. Re-run Get Module to apply."
+end)
+
+settingsBtn.Click:Connect(function()
+	pathBox.Text = getForgeVFXPath()
+	storageBox.Text = getVFXStoragePath()
+	settingsWidget.Enabled = not settingsWidget.Enabled
+end)
+
+-- ============================================================
+-- Animation sources: Moon Animator 2 saves and Eclipse Animator projects
+-- Both are read into one shape, so generation doesn't care which animator made them:
+--   { object, name, fps,
+--     rigs   = { {instance} },
+--     items  = { {label, isCamera, instance, properties = { {name, keyframes} }} },
+--     events = { {Frame, String} } }
+--   keyframes = { {Frame, Value, ValueClass, Style, Direction} }  (Moon-style ease names)
+-- ============================================================
+
+-- Moon keyframe folders hold Values["i"] at frame N + i (grouped keyframes hold several)
+local function readMoonKeyframes(propertyOBJ)
+	local frameFolders = {}
+	for _, v in pairs(propertyOBJ:GetChildren()) do
+		if v:IsA("Folder") and v.Name ~= "default" and tonumber(v.Name) ~= nil then
+			frameFolders[#frameFolders + 1] = v
+		end
+	end
+	table.sort(frameFolders, function(a, b)
+		return tonumber(a.Name) < tonumber(b.Name)
+	end)
+
+	local keyframes = {}
+	for _, framedata in ipairs(frameFolders) do
+		local Frame = tonumber(framedata.Name)
+		local Values = framedata:FindFirstChild("Values")
+		if not Values or not Values:FindFirstChild("0") then
+			continue
+		end
+		local Eases = framedata:FindFirstChild("Eases")
+		local offsets = {}
+		for _, Value in ipairs(Values:GetChildren()) do
+			local offset = tonumber(Value.Name)
+			if offset then
+				offsets[#offsets + 1] = { offset = offset, object = Value }
+			end
+		end
+		table.sort(offsets, function(a, b)
+			return a.offset < b.offset
+		end)
+
+		for _, entry in ipairs(offsets) do
+			local EaseStyle = "Linear"
+			local EaseDirection = "In"
+			local Ease = Eases and Eases:FindFirstChild(tostring(entry.offset))
+			if Ease then
+				local TypeInst = Ease:FindFirstChild("Type")
+				if TypeInst then
+					EaseStyle = TypeInst.Value
+				end
+				local Params = Ease:FindFirstChild("Params")
+				local DirInst = Params and Params:FindFirstChild("Direction")
+				if DirInst then
+					EaseDirection = DirInst.Value
+				end
+			end
+			keyframes[#keyframes + 1] = {
+				Frame = Frame + entry.offset,
+				Value = entry.object.Value,
+				ValueClass = entry.object.ClassName,
+				Style = EaseStyle,
+				Direction = EaseDirection,
+			}
+		end
+	end
+	return keyframes
+end
+
+local function readMoonSave(SaveOBJ)
+	local ok, Decoded = pcall(function()
+		return HttpService:JSONDecode(SaveOBJ.Value)
+	end)
+	if not ok or type(Decoded) ~= "table" then
+		return nil, "Failed to decode"
+	end
+
+	local Items = Decoded.Items
+	local Information = Decoded.Information
+	if not Items or not Information then
+		return nil, "Invalid save file"
+	end
+
+	local Source = {
+		object = SaveOBJ,
+		name = SaveOBJ.Name,
+		fps = tonumber(Information.FPS) or 60,
+		rigs = {},
+		items = {},
+		events = {},
+	}
+
+	for idx, Item in ipairs(Items) do
+		local DataInstance = SaveOBJ:FindFirstChild(tostring(idx))
+		if not DataInstance then
+			continue
+		end
+		local ItemType = Item.Path.ItemType
+		local InstanceNames = Item.Path.InstanceNames
+
+		if ItemType == "Rig" then
+			if DataInstance:FindFirstChild("Rig") then
+				Source.rigs[#Source.rigs + 1] = { instance = SearchInstance(InstanceNames) }
+			end
+			continue
+		end
+
+		local item = {
+			label = table.concat(InstanceNames, "."),
+			isCamera = ItemType == "Camera",
+			instance = ItemType == "Camera" and workspace.CurrentCamera or SearchInstance(InstanceNames),
+			properties = {},
+		}
+		for _, propertyOBJ in pairs(DataInstance:GetChildren()) do
+			if propertyOBJ.Name == "Rig" or propertyOBJ.Name == "AttachToPart" then
+				continue
+			end
+			item.properties[#item.properties + 1] = {
+				name = propertyOBJ.Name,
+				keyframes = readMoonKeyframes(propertyOBJ),
+			}
+		end
+		Source.items[#Source.items + 1] = item
+	end
+
+	-- Moon markers: codeBegin runs at the marker's frame, codeEnd when the marker ends (frame + width)
+	for _, OBJ in pairs(SaveOBJ:GetDescendants()) do
+		if OBJ.Name == "codeBegin" or OBJ.Name == "codeEnd" then
+			local Frame = tonumber(OBJ.Parent.Name)
+			if Frame then
+				if OBJ.Name == "codeEnd" then
+					local width = OBJ.Parent:FindFirstChild("width")
+					Frame += width and tonumber(width.Value) or 0
+				end
+				Source.events[#Source.events + 1] = { Frame = Frame, String = OBJ.Value }
+			end
+		end
+	end
+
+	return Source
+end
+
+-- || Eclipse Animator projects (ServerStorage["Eclipse Animator Saves"].EclipseAnimator_Saves) || --
+
+local ECLIPSE_STYLES = {
+	Linear = true,
+	Constant = true,
+	Sine = true,
+	Quad = true,
+	Cubic = true,
+	Quart = true,
+	Quint = true,
+	Sextic = true,
+	Expo = true,
+	Circ = true,
+	Back = true,
+	Bounce = true,
+	Elastic = true,
+}
+local ECLIPSE_STYLE_ALIASES = { Sinusoidal = "Sine", Exponential = "Expo", Circular = "Circ", CubicV2 = "Cubic" }
+
+-- Eclipse chunked text: a StringValue, or a Folder of StringValues joined in name order
+local function eclipseReadChunks(node)
+	if node:IsA("StringValue") then
+		return node.Value
+	end
+	local chunks = node:GetChildren()
+	table.sort(chunks, function(a, b)
+		return a.Name < b.Name
+	end)
+	local text = {}
+	for _, chunk in ipairs(chunks) do
+		if chunk:IsA("StringValue") then
+			text[#text + 1] = chunk.Value
+		end
+	end
+	return table.concat(text)
+end
+
+local function eclipseText(folder, name)
+	local node = folder:FindFirstChild(name)
+	return node and eclipseReadChunks(node) or ""
+end
+
+-- EclipseKeyframeData values: {"T":[key, value, ...]}, {"C":[cframe]}, {"V":[vector]}, {"E":[enum, item]}
+local function eclipseKeyDecode(value)
+	if typeof(value) ~= "table" then
+		return value
+	end
+	if value.T then
+		local out = {}
+		for index = 1, #value.T, 2 do
+			out[value.T[index]] = eclipseKeyDecode(value.T[index + 1])
+		end
+		return out
+	elseif value.C then
+		return CFrame.new(table.unpack(value.C))
+	elseif value.V then
+		return Vector3.new(table.unpack(value.V))
+	elseif value.E then
+		local ok, item = pcall(function()
+			return Enum[value.E[1]][value.E[2]]
+		end)
+		return ok and item or nil
+	end
+	return nil
+end
+
+-- EclipseProperties values: {"t":"cf","v":[...]}, {"t":"table","v":[[key, value], ...]}, ...
+local function eclipseDocDecode(value)
+	if type(value) ~= "table" then
+		return value
+	end
+	local t, v = value.t, value.v
+	if t == "cf" then
+		return CFrame.new(table.unpack(v))
+	elseif t == "v3" then
+		return Vector3.new(table.unpack(v))
+	elseif t == "Color3" then
+		return Color3.new(table.unpack(v))
+	elseif t == "Vector2" then
+		return Vector2.new(table.unpack(v))
+	elseif t == "NumberRange" then
+		return NumberRange.new(table.unpack(v))
+	elseif t == "UDim" then
+		return UDim.new(table.unpack(v))
+	elseif t == "UDim2" then
+		return UDim2.new(table.unpack(v))
+	elseif t == "Rect" then
+		return Rect.new(table.unpack(v))
+	elseif t == "BrickColor" then
+		return BrickColor.new(v)
+	elseif t == "NumberSequence" then
+		local keys = {}
+		for _, key in ipairs(v) do
+			keys[#keys + 1] = NumberSequenceKeypoint.new(key[1], key[2], key[3] or 0)
+		end
+		return NumberSequence.new(keys)
+	elseif t == "ColorSequence" then
+		local keys = {}
+		for _, key in ipairs(v) do
+			keys[#keys + 1] = ColorSequenceKeypoint.new(key[1], eclipseDocDecode(key[2]))
+		end
+		return ColorSequence.new(keys)
+	elseif t == "enum" then
+		local ok, item = pcall(function()
+			return Enum[value.e][v]
+		end)
+		return ok and item or nil
+	end
+	local result = {}
+	for _, entry in ipairs(type(v) == "table" and v or {}) do
+		result[entry[1]] = eclipseDocDecode(entry[2])
+	end
+	return result
+end
+
+-- Eclipse easing -> Moon-style names (fixEaseStyle/fixEaseDirection map them to Roblox later)
+local function eclipseEase(key)
+	local style = key.EasingStyle
+	local native = typeof(style) == "EnumItem"
+	if native then
+		style = style.Name
+	end
+	style = ECLIPSE_STYLE_ALIASES[style] or style or "Bezier"
+	local direction = key.EasingDirection
+	if typeof(direction) == "EnumItem" then
+		direction = direction.Name
+	end
+	direction = direction or "Automatic"
+
+	if style == "Bezier" then
+		-- Eclipse's default curve (0.42, 0, 0.58, 1) is an ease-in-out
+		return "Sine", "InOut"
+	end
+	if not ECLIPSE_STYLES[style] then
+		return "Linear", "In"
+	end
+	if direction == "Automatic" then
+		direction = (style == "Back" or style == "Bounce" or style == "Elastic") and "Out" or "In"
+	end
+	if native and style == "Cubic" and (direction == "In" or direction == "Out") then
+		-- Roblox pose easing names Cubic In/Out the other way round from TweenService
+		direction = direction == "In" and "Out" or "In"
+	end
+	return style, direction
+end
+
+local function clockNumber(value)
+	if typeof(value) == "number" then
+		return value
+	end
+	if typeof(value) ~= "string" then
+		return nil
+	end
+	local number = tonumber(value)
+	if number then
+		return number
+	end
+	local h, m, s = value:match("^%s*(%d+):(%d+):?([%d%.]*)%s*$")
+	if not h then
+		return nil
+	end
+	return tonumber(h) + tonumber(m) / 60 + (tonumber(s) or 0) / 3600
+end
+
+-- The exact value of an Eclipse property key (PropertyValue, or decoded from its C0 carrier)
+local function eclipsePropertyValue(object, id, key)
+	local c0 = key.C0
+	if object:IsA("Lighting") and (id == "ClockTime" or id == "TimeOfDay") then
+		return clockNumber(key.PropertyValue) or (typeof(c0) == "CFrame" and c0.X) or nil
+	end
+	local value = key.PropertyValue
+	if value == nil and typeof(c0) == "CFrame" then
+		local live
+		pcall(function()
+			live = object[id]
+		end)
+		local kind = typeof(live)
+		if kind == "number" then
+			value = c0.X
+		elseif kind == "Vector3" then
+			value = c0.Position
+		elseif kind == "Vector2" then
+			value = Vector2.new(c0.X, c0.Y)
+		elseif kind == "Color3" then
+			value = Color3.new(math.clamp(c0.X, 0, 1), math.clamp(c0.Y, 0, 1), math.clamp(c0.Z, 0, 1))
+		elseif kind == "CFrame" then
+			value = c0
+		end
+	end
+	-- Sequences and ranges are animated as one value, the same way Moon stores them
+	if typeof(value) == "NumberSequence" or typeof(value) == "ColorSequence" then
+		value = value.Keypoints[1].Value
+	elseif typeof(value) == "NumberRange" then
+		value = value.Min
+	end
+	return value
+end
+
+-- Lua expression that reaches `instance` (workspace.X.Y / game:GetService("Lighting").X)
+local function luaPathOf(instance)
+	local parts = {}
+	local node = instance
+	while node and node.Parent ~= game do
+		table.insert(parts, 1, node.Name)
+		node = node.Parent
+	end
+	if not node then
+		return nil
+	end
+	local code = node == workspace and "workspace" or ('game:GetService("' .. node.ClassName .. '")')
+	for _, name in ipairs(parts) do
+		if name:match("^[%a_][%w_]*$") then
+			code = code .. "." .. name
+		else
+			code = code .. '["' .. (name:gsub('"', '\\"')) .. '"]'
+		end
+	end
+	return code
+end
+
+-- Eclipse's own VFX emits and sound events become event code, like Moon's codeBegin
+local function eclipseEventExtras(event, object)
+	local lines = {}
+
+	local okEmits, emits = pcall(function()
+		return HttpService:JSONDecode(eclipseText(event, "Emits"))
+	end)
+	if object and okEmits and type(emits) == "table" then
+		for _, row in ipairs(emits) do
+			if type(row) ~= "table" then
+				continue
+			end
+			local node = object
+			for _, step in ipairs(type(row.Path) == "table" and row.Path or {}) do
+				local count, found = 0, nil
+				for _, child in ipairs(node:GetChildren()) do
+					if child.Name == step.Name and child.ClassName == step.Class then
+						count += 1
+						if count == (tonumber(step.Index) or 1) then
+							found = child
+							break
+						end
+					end
+				end
+				node = found
+				if not node then
+					break
+				end
+			end
+			if not node then
+				continue
+			end
+			local targets = { node }
+			if row.Mode == "Selected" then
+				for _, child in ipairs(node:GetChildren()) do
+					targets[#targets + 1] = child
+				end
+			elseif row.Mode ~= "Exact" then
+				for _, descendant in ipairs(node:GetDescendants()) do
+					targets[#targets + 1] = descendant
+				end
+			end
+			local action = row.Action or "Emit"
+			for _, target in ipairs(targets) do
+				local path = luaPathOf(target)
+				if not path then
+					continue
+				end
+				if action == "Emit" and target:IsA("ParticleEmitter") then
+					local count = math.clamp(math.floor(tonumber(target:GetAttribute("EmitCount")) or 1), 1, 100000)
+					lines[#lines + 1] = path .. ":Emit(" .. count .. ")"
+				elseif
+					(action == "Enable" or action == "Disable")
+					and (target:IsA("ParticleEmitter") or target:IsA("Beam") or target:IsA("Trail"))
+				then
+					lines[#lines + 1] = path .. ".Enabled = " .. tostring(action == "Enable")
+				end
+			end
+		end
+	end
+
+	local sounds = event:FindFirstChild("Sounds")
+	if sounds then
+		local list = sounds:GetChildren()
+		table.sort(list, function(a, b)
+			return a.Name < b.Name
+		end)
+		for _, sound in ipairs(list) do
+			local id = sound:GetAttribute("AudioId")
+			if type(id) == "string" and id ~= "" and not id:find("^eclipse%-local%-audio:") then
+				lines[#lines + 1] = string.format(
+					"do local s = Instance.new('Sound') s.SoundId = %q s.Volume = %s s.PlaybackSpeed = %s s.Parent = model:FindFirstChild('RootPart') or model s:Play() Debris:AddItem(s, %s) end",
+					id,
+					tostring(tonumber(sound:GetAttribute("Volume")) or 0.5),
+					tostring(tonumber(sound:GetAttribute("Speed")) or 1),
+					tostring(math.max(1, (tonumber(sound:GetAttribute("Duration")) or 0) + 1))
+				)
+			end
+		end
+	end
+
+	return table.concat(lines, "\n")
+end
+
+local function followEclipsePath(root, json)
+	if type(json) ~= "string" then
+		return nil
+	end
+	local ok, path = pcall(function()
+		return HttpService:JSONDecode(json)
+	end)
+	if not ok or type(path) ~= "table" then
+		return nil
+	end
+	local node = root
+	for _, step in ipairs(path) do
+		if type(step) ~= "table" or step.link then
+			return nil
+		end
+		local count, found = 0, nil
+		for _, child in ipairs(node:GetChildren()) do
+			if child.Name == step.name and child.ClassName == step.class then
+				count += 1
+				if count == step.index then
+					found = child
+					break
+				end
+			end
+		end
+		if not found then
+			return nil
+		end
+		node = found
+	end
+	return node
+end
+
+-- Finds the object an Eclipse "Rigs" entry animates, the same way Eclipse links it
+local function resolveEclipseEntry(entry, isCamera)
+	local function usable(object)
+		return object and object.Parent and (not isCamera or object:FindFirstChild("CamPart") ~= nil)
+	end
+	local reference = entry:FindFirstChild("Rig")
+	local object = reference and reference:IsA("ObjectValue") and reference.Value
+	if usable(object) then
+		return object
+	end
+	object = followEclipsePath(game, entry:GetAttribute("RigGamePath"))
+	if usable(object) and object.ClassName == entry:GetAttribute("RigClass") then
+		return object
+	end
+	local id = entry:GetAttribute("RigId")
+	local name = entry:GetAttribute("RigName") or entry.Name
+	local class = entry:GetAttribute("RigClass")
+	local byName
+	for _, descendant in ipairs(workspace:GetDescendants()) do
+		if id and descendant:GetAttribute("EclipseTrackId") == id and usable(descendant) then
+			return descendant
+		end
+		if not isCamera and descendant.Name == name and (not class or descendant.ClassName == class) then
+			if byName then
+				byName = false
+			elseif byName == nil then
+				byName = descendant
+			end
+		end
+	end
+	return byName or nil
+end
+
+-- Moon's rig test: a Model whose PrimaryPart drives joints
+local function isRigModel(object)
+	if not object:IsA("Model") then
+		return false
+	end
+	local primary = object.PrimaryPart
+	if not primary or not primary.Parent then
+		return false
+	end
+	if primary:FindFirstChildOfClass("Bone") then
+		return true
+	end
+	for _, descendant in ipairs(object:GetDescendants()) do
+		if descendant:IsA("Motor6D") and descendant.Part0 == primary and descendant.Part1 and descendant.Part1.Parent then
+			return true
+		end
+		if descendant:IsA("AnimationConstraint") and descendant.Attachment0 and descendant.Attachment0.Parent == primary then
+			return true
+		end
+	end
+	return false
+end
+
+-- FOV keys of an Eclipse camera: FovPart's C0.Y is the offset from the camera's default FOV
+local function eclipseCameraFov(entry, sequence, cameraRig)
+	local data = sequence:FindFirstChild("EclipseKeyframeData")
+	if not data then
+		return {}
+	end
+	local ok, decoded = pcall(function()
+		return HttpService:JSONDecode(eclipseReadChunks(data))
+	end)
+	if not ok or type(decoded) ~= "table" or type(decoded.tracks) ~= "table" then
+		return {}
+	end
+	local default = tonumber(entry:GetAttribute("CameraDefaultFOV")) or 70
+	local holder = cameraRig and cameraRig:FindFirstChild("FieldOfView")
+	local defaultValue = holder and holder:FindFirstChild("default")
+	if defaultValue and defaultValue:IsA("NumberValue") then
+		default = defaultValue.Value
+	end
+
+	local keyframes = {}
+	for _, track in ipairs(decoded.tracks) do
+		local last = type(track.path) == "table" and track.path[#track.path]
+		if type(last) == "table" and last.name == "FovPart" and type(track.keys) == "table" then
+			for _, record in ipairs(track.keys) do
+				local key = eclipseKeyDecode(record.data)
+				if type(key) == "table" and typeof(key.C0) == "CFrame" and not key.Disabled then
+					local style, direction = eclipseEase(key)
+					keyframes[#keyframes + 1] = {
+						Frame = record.frame,
+						Value = math.clamp(default + key.C0.Y, 1, 120),
+						Style = style,
+						Direction = direction,
+					}
+				end
+			end
+		end
+	end
+	table.sort(keyframes, function(a, b)
+		return a.Frame < b.Frame
+	end)
+	return keyframes
+end
+
+local function findEclipseProject(object)
+	local node = object
+	while node and node ~= game do
+		if node:IsA("Folder") and node:GetAttribute("EclipseSave") == true and node:FindFirstChild("Rigs") then
+			return node
+		end
+		node = node.Parent
+	end
+	return nil
+end
+
+local function readEclipseProject(project)
+	local fps = project:GetAttribute("FPS")
+	if typeof(fps) ~= "number" or fps < 1 or fps > 1000 or fps % 1 ~= 0 then
+		fps = 60
+	end
+	local Source = { object = project, name = project.Name, fps = fps, rigs = {}, items = {}, events = {} }
+
+	local entries = project.Rigs:GetChildren()
+	table.sort(entries, function(a, b)
+		local first = tonumber(a:GetAttribute("Order")) or math.huge
+		local second = tonumber(b:GetAttribute("Order")) or math.huge
+		if first ~= second then
+			return first < second
+		end
+		return a.Name < b.Name
+	end)
+
+	for _, entry in ipairs(entries) do
+		local sequence = entry:FindFirstChild("Animation")
+		if not sequence then
+			continue
+		end
+		local isCamera = entry:GetAttribute("EclipseCamera") == true
+		local object = resolveEclipseEntry(entry, isCamera)
+		local label = project.Name .. " > " .. entry.Name
+
+		-- Events: CodeBegin at Frame, CodeEnd at Frame + Duration (disabled tracks/events don't run)
+		local events = sequence:FindFirstChild("EclipseEvents")
+		if events and events:GetAttribute("Enabled") ~= false then
+			for _, event in ipairs(events:GetChildren()) do
+				local frame = event:GetAttribute("Frame")
+				if not event:IsA("Folder") or typeof(frame) ~= "number" or event:GetAttribute("Enabled") == false then
+					continue
+				end
+				frame = math.max(0, math.floor(frame + 0.5))
+				local duration = math.max(0, math.floor((tonumber(event:GetAttribute("Duration")) or 0) + 0.5))
+				local codeBegin = eclipseText(event, "CodeBegin")
+				local extras = eclipseEventExtras(event, object)
+				if extras ~= "" then
+					codeBegin = codeBegin ~= "" and (codeBegin .. "\n" .. extras) or extras
+				end
+				if codeBegin ~= "" then
+					Source.events[#Source.events + 1] = { Frame = frame, String = codeBegin }
+				end
+				local codeEnd = eclipseText(event, "CodeEnd")
+				if codeEnd ~= "" then
+					Source.events[#Source.events + 1] = { Frame = frame + duration, String = codeEnd }
+				end
+			end
+		end
+
+		if isCamera then
+			-- Eclipse's camera is a rig (RootPart + CamPart), animated like a Moon CameraRig
+			if object then
+				Source.rigs[#Source.rigs + 1] = { instance = object }
+			else
+				warn(">> [Generate] The Eclipse camera of", label, "doesn't exist yet - open the project in Eclipse once so it builds the camera rig.")
+			end
+			local fovKeys = eclipseCameraFov(entry, sequence, object)
+			if #fovKeys > 0 then
+				Source.items[#Source.items + 1] = {
+					label = label,
+					isCamera = true,
+					instance = workspace.CurrentCamera,
+					properties = { { name = "FieldOfView", keyframes = fovKeys } },
+				}
+			end
+			continue
+		end
+
+		if not object then
+			warn(">> [Generate] Could not find:", label)
+			continue
+		end
+
+		if isRigModel(object) then
+			Source.rigs[#Source.rigs + 1] = { instance = object }
+			continue
+		end
+
+		local item = { label = label, isCamera = false, instance = object, properties = {} }
+		local properties = sequence:FindFirstChild("EclipseProperties")
+		if properties then
+			local ok, data = pcall(function()
+				return eclipseDocDecode(HttpService:JSONDecode(eclipseReadChunks(properties)))
+			end)
+			if ok and type(data) == "table" and type(data.tracks) == "table" then
+				for _, row in pairs(data.tracks) do
+					if type(row) ~= "table" or row.enabled == false or row.disabled == true or type(row.keys) ~= "table" then
+						continue
+					end
+					local frames = {}
+					for frame in pairs(row.keys) do
+						frames[#frames + 1] = frame
+					end
+					table.sort(frames)
+					local keyframes = {}
+					for _, frame in ipairs(frames) do
+						local key = row.keys[frame]
+						if type(key) ~= "table" or key.Disabled then
+							continue
+						end
+						local value = eclipsePropertyValue(object, row.id, key)
+						if value ~= nil then
+							local style, direction = eclipseEase(key)
+							keyframes[#keyframes + 1] = { Frame = frame, Value = value, Style = style, Direction = direction }
+						end
+					end
+					item.properties[#item.properties + 1] = { name = row.id, keyframes = keyframes }
+				end
+			else
+				warn(">> [Generate] Couldn't read the property tracks of", label)
+			end
+		end
+		Source.items[#Source.items + 1] = item
+	end
+
+	return Source
+end
+
+-- Anything inside an Eclipse project folder, or a Moon save (StringValue)
+local function readAnimationSource(object)
+	local project = findEclipseProject(object)
+	if project then
+		return readEclipseProject(project)
+	end
+	if object:IsA("StringValue") then
+		return readMoonSave(object)
+	end
+	return nil, "Invalid file (select a MoonAnimator2 save or an Eclipse Animator project)"
+end
+
+local function runGeneration(includeCutscene)
 	local SelectedList = Selection:Get()
 	if #SelectedList == 0 then
-		warn(">> Please select MoonAnimator2 save file(s) to generate.")
+		warn(">> Please select MoonAnimator2 save file(s) or Eclipse Animator project(s) to generate.")
 		return
 	end
 
@@ -264,32 +1371,25 @@ generateBtn.Click:Connect(function()
 	local userWantsRigs = false
 	local prompted = false
 
+	local handledSources = {}
 	for _, SaveOBJ in pairs(SelectedList) do
-		if SaveOBJ.ClassName ~= "StringValue" then
-			warn(">> Invalid file", SaveOBJ)
+		local Source, SourceError = readAnimationSource(SaveOBJ)
+		if not Source then
+			warn(">> " .. SourceError, SaveOBJ)
 			continue
 		end
 
-		local ok, Decoded = pcall(function()
-			return HttpService:JSONDecode(SaveOBJ.Value)
-		end)
-		if not ok or not Decoded or Decoded == "" then
-			warn(">> Failed to decode", SaveOBJ)
+		-- Selecting several parts of one Eclipse project generates it once
+		if handledSources[Source.object] then
 			continue
 		end
+		handledSources[Source.object] = true
 
-		local Items = Decoded.Items
-		local Information = Decoded.Information
-		if not Items or not Information then
-			warn(">> Invalid save file", SaveOBJ)
-			continue
-		end
-
-		local FPS = 60
+		local FPS = Source.fps
 
 		-- Create output model
 		local OutputModel = Instance.new("Model")
-		OutputModel.Name = SaveOBJ.Name .. "_VFX"
+		OutputModel.Name = Source.name .. "_VFX"
 
 		-- Helper: ensure folder path exists inside OutputModel
 		local function ensureFolderPath(parts)
@@ -311,47 +1411,44 @@ generateBtn.Click:Connect(function()
 		local detectedRigs = {} -- { {name=string, instance=Instance, isCameraRig=bool, hasAnimator=bool} }
 		local hasCutscene = false
 
-		for idx, Item in ipairs(Items) do
-			if Item.Path.ItemType == "Rig" then
-				local DataInstance = SaveOBJ:FindFirstChild(tostring(idx))
-				if DataInstance and DataInstance:FindFirstChild("Rig") then
-					local actual = SearchInstance(Item.Path.InstanceNames)
-					if actual then
-						local rigName = actual.Name
-						local camRig = isCameraRig(actual)
-						local hasAnim = hasAnimator(actual)
+		for _, RigSource in ipairs(Source.rigs) do
+			local actual = RigSource.instance
+			if actual then
+				local rigName = actual.Name
+				local camRig = isCameraRig(actual)
+				local hasAnim = hasAnimator(actual)
 
-						if camRig then
-							hasCutscene = true
-							detectedRigs[#detectedRigs + 1] = {
-								name = rigName,
-								instance = actual,
-								isCameraRig = true,
-								hasAnimator = hasAnim,
-							}
-							print(">> [Generate] Detected CameraRig:", rigName)
-						elseif hasAnim then
-							-- Character rig with Humanoid/AnimationController
-							detectedRigs[#detectedRigs + 1] = {
-								name = rigName,
-								instance = actual,
-								isCameraRig = false,
-								hasAnimator = true,
-							}
-							print(">> [Generate] Detected animated rig:", rigName)
-						end
+				if camRig and includeCutscene then
+					hasCutscene = true
+					detectedRigs[#detectedRigs + 1] = {
+						name = rigName,
+						instance = actual,
+						isCameraRig = true,
+						hasAnimator = hasAnim,
+					}
+					print(">> [Generate] Detected CameraRig:", rigName)
+				elseif camRig then
+					print(">> [Generate] Skipping CameraRig (no-cutscene mode):", rigName)
+				elseif hasAnim then
+					-- Character rig with Humanoid/AnimationController
+					detectedRigs[#detectedRigs + 1] = {
+						name = rigName,
+						instance = actual,
+						isCameraRig = false,
+						hasAnimator = true,
+					}
+					print(">> [Generate] Detected animated rig:", rigName)
+				end
 
-						-- Set BaseRoot from the first non-camera rig
-						if not BaseRoot and not camRig then
-							local hrp = actual:FindFirstChild("HumanoidRootPart")
-							if hrp then
-								BaseRoot = hrp
-							elseif actual:IsA("BasePart") then
-								BaseRoot = actual
-							elseif actual:IsA("Model") and actual.PrimaryPart then
-								BaseRoot = actual.PrimaryPart
-							end
-						end
+				-- Set BaseRoot from the first non-camera rig
+				if not BaseRoot and not camRig then
+					local hrp = actual:FindFirstChild("HumanoidRootPart")
+					if hrp then
+						BaseRoot = hrp
+					elseif actual:IsA("BasePart") then
+						BaseRoot = actual
+					elseif actual:IsA("Model") and actual.PrimaryPart then
+						BaseRoot = actual.PrimaryPart
 					end
 				end
 			end
@@ -394,6 +1491,16 @@ generateBtn.Click:Connect(function()
 				local clone = rig.instance:Clone()
 				clone:SetAttribute("GroupType", rig.isCameraRig and "CameraRig" or "CharacterRig")
 
+				-- Eclipse poses rigs through Motor6D.C0 while it's open and keeps the rest pose in an attribute
+				for _, motor in ipairs(clone:GetDescendants()) do
+					if motor:IsA("Motor6D") then
+						local rest = motor:GetAttribute("EclipseAnimatorDefaultC0")
+						if typeof(rest) == "CFrame" then
+							motor.C0 = rest
+						end
+					end
+				end
+
 				-- Find the root part of the rig
 				local rigRoot = clone:FindFirstChild("HumanoidRootPart") or (clone:IsA("Model") and clone.PrimaryPart)
 
@@ -434,31 +1541,16 @@ generateBtn.Click:Connect(function()
 		local usedVarNames = {}
 		local varCounter = 0
 
-		for idx, Item in ipairs(Items) do
-			local ItemType = Item.Path.ItemType
-			local InstanceNames = Item.Path.InstanceNames
-			local DataInstance = SaveOBJ:FindFirstChild(tostring(idx))
-			if not DataInstance then
-				continue
-			end
-			if ItemType == "Rig" then
-				continue
-			end
-
-			local actual = nil
-			if ItemType == "Camera" then
-				actual = workspace.CurrentCamera
-			else
-				actual = SearchInstance(InstanceNames)
-			end
+		for _, ItemSource in ipairs(Source.items) do
+			local actual = ItemSource.instance
 
 			if not actual then
-				warn(">> [Generate] Could not find:", table.concat(InstanceNames, "."))
+				warn(">> [Generate] Could not find:", ItemSource.label)
 				continue
 			end
 
 			-- Determine category
-			local isCamera = (ItemType == "Camera")
+			local isCamera = ItemSource.isCamera
 			local isWorkspaceDesc = (not isCamera) and actual:IsDescendantOf(workspace)
 			local isLightingChild = false
 			pcall(function()
@@ -470,6 +1562,11 @@ generateBtn.Click:Connect(function()
 				isCoreGuiChild = actual:IsDescendantOf(game:GetService("CoreGui"))
 			end)
 			local isScreenCover = (actual.Name == "Screen Cover")
+
+			-- No-cutscene mode: skip camera, lighting, and screen-space items entirely
+			if not includeCutscene and (isCamera or isLightingChild or isCoreGuiChild or isScreenCover) then
+				continue
+			end
 
 			local varName = ""
 			local instanceAccessor = ""
@@ -578,7 +1675,7 @@ generateBtn.Click:Connect(function()
 
 			-- Skip if we couldn't determine a path
 			if varName == "" then
-				warn(">> [Generate] Skipping unhandled item:", table.concat(InstanceNames, "."))
+				warn(">> [Generate] Skipping unhandled item:", ItemSource.label)
 				continue
 			end
 
@@ -595,70 +1692,25 @@ generateBtn.Click:Connect(function()
 			end
 
 			-- ========== Compile property keyframes → animation code ==========
-			for _, propertyOBJ in pairs(DataInstance:GetChildren()) do
-				local Property = propertyOBJ.Name
-				if Property == "Rig" or Property == "AttachToPart" then
-					continue
-				end
-
-				-- Gather sorted frame folders
-				local frameFolders = {}
-				for _, v in pairs(propertyOBJ:GetChildren()) do
-					if v:IsA("Folder") and v.Name ~= "default" and tonumber(v.Name) ~= nil then
-						frameFolders[#frameFolders + 1] = v
-					end
-				end
-				table.sort(frameFolders, function(a, b)
-					return tonumber(a.Name) < tonumber(b.Name)
-				end)
+			for _, PropertySource in ipairs(ItemSource.properties) do
+				local Property = PropertySource.name
 
 				-- Build keyframe list
 				local keyframes = {}
-				for _, framedata in ipairs(frameFolders) do
-					local Frame = tonumber(framedata.Name)
-					local Values = framedata:FindFirstChild("Values")
-					if not Values then
-						continue
-					end
-					local Value = Values:FindFirstChild("0")
-					if not Value then
-						continue
-					end
-
-					local EaseStyle = "Linear"
-					local EaseDirection = "In"
-					local Eases = framedata:FindFirstChild("Eases")
-					if Eases then
-						local FirstEase = Eases:FindFirstChild("0")
-						if FirstEase then
-							local TypeInst = FirstEase:FindFirstChild("Type")
-							if TypeInst then
-								EaseStyle = TypeInst.Value
-							end
-							local Params = FirstEase:FindFirstChild("Params")
-							if Params then
-								local DirInst = Params:FindFirstChild("Direction")
-								if DirInst then
-									EaseDirection = DirInst.Value
-								end
-							end
-						end
-					end
-
-					local val = Value.Value
-					local valClass = Value.ClassName
+				for _, raw in ipairs(PropertySource.keyframes) do
+					local val = raw.Value
 
 					-- Make CFrame relative to BaseRoot
-					if Property == "CFrame" and BaseRoot then
+					if Property == "CFrame" and BaseRoot and typeof(val) == "CFrame" then
 						val = BaseRoot.CFrame:ToObjectSpace(val)
 					end
 
 					keyframes[#keyframes + 1] = {
-						Time = frameToTime(Frame, FPS),
-						Style = fixEaseStyle(EaseStyle),
-						Direction = EaseDirection,
+						Time = frameToTime(raw.Frame, FPS),
+						Style = fixEaseStyle(raw.Style),
+						Direction = fixEaseDirection(raw.Direction),
 						Value = val,
-						ValueClass = valClass,
+						ValueClass = raw.ValueClass,
 					}
 				end
 
@@ -707,7 +1759,7 @@ generateBtn.Click:Connect(function()
 				-- Non-camera: generate animation code
 				if not didCamera then
 					-- Boolean/non-tweenable: generate direct setProperty calls
-					if propType == "boolean" then
+					if propType == "boolean" or propType == "string" or propType == "EnumItem" then
 						for i = 1, #keyframes do
 							local kf = keyframes[i]
 							local timeStr = string.format("%.4g", kf.Time)
@@ -762,16 +1814,11 @@ generateBtn.Click:Connect(function()
 		-- ========== PASS 3: Collect & remap event code ==========
 		local eventLines = {}
 		local eventContainer = {}
-		for _, OBJ in pairs(SaveOBJ:GetDescendants()) do
-			if OBJ.Name == "codeBegin" or OBJ.Name == "codeEnd" then
-				local Frame = tonumber(OBJ.Parent.Name)
-				if Frame then
-					eventContainer[#eventContainer + 1] = {
-						Time = frameToTime(Frame, FPS),
-						String = OBJ.Value,
-					}
-				end
-			end
+		for _, EventSource in ipairs(Source.events) do
+			eventContainer[#eventContainer + 1] = {
+				Time = frameToTime(EventSource.Frame, FPS),
+				String = EventSource.String,
+			}
 		end
 		table.sort(eventContainer, function(a, b)
 			return a.Time < b.Time
@@ -893,24 +1940,20 @@ generateBtn.Click:Connect(function()
 
 		-- Header
 		src[#src + 1] = "-- Auto-generated VFX Module by VFXComplier Plugin"
-		src[#src + 1] = "-- Source: " .. SaveOBJ.Name
+		src[#src + 1] = "-- Source: " .. Source.name
 		src[#src + 1] = ""
 		src[#src + 1] = "local TweenService = game:GetService('TweenService')"
 		src[#src + 1] = "local RunService = game:GetService('RunService')"
 		src[#src + 1] = "local Debris = game:GetService('Debris')"
 		src[#src + 1] = "local Players = game:GetService('Players')"
 
-		-- Check if any event code uses ForgeVFX
-		local needsForgeVFX = false
-		for _, line in ipairs(eventLines) do
-			if line:find("ForgeVFX%.") then
-				needsForgeVFX = true
-				break
-			end
-		end
-		if needsForgeVFX then
-			src[#src + 1] = "local ForgeVFX = require(game:GetService('ReplicatedStorage'):WaitForChild('ForgeVFX'))"
-		end
+		-- Requires: ForgeVFX + Payload library (always emitted, path from Settings)
+		local pathSegments = parseForgeVFXPath(getForgeVFXPath()) or string.split(DEFAULT_FORGEVFX_PATH, ".")
+		local forgeExpr = segmentsToRequireExpr(pathSegments)
+		local payloadParentExpr = segmentsToRequireExpr(pathSegments, #pathSegments - 1)
+		src[#src + 1] = "local ForgeVFX = require(" .. forgeExpr .. ")"
+		src[#src + 1] = "local Payload = require(" .. payloadParentExpr .. ':WaitForChild("Payload"):WaitForChild("VFXPayload"))'
+		src[#src + 1] = "local setProperty, tweenProperty, playKeyframes, safeEmit = Payload.setProperty, Payload.tweenProperty, Payload.playKeyframes, Payload.safeEmit"
 
 		src[#src + 1] = ""
 		src[#src + 1] = "local module = {}"
@@ -936,77 +1979,6 @@ generateBtn.Click:Connect(function()
 		end
 		src[#src + 1] = ""
 
-		-- setProperty utility (still needed for camera/events)
-		src[#src + 1] = "local function setProperty(obj, prop, val, delayTime)"
-		src[#src + 1] = "\tif delayTime > 0 then"
-		src[#src + 1] = "\t\ttask.delay(delayTime, function() if obj then obj[prop] = val end end)"
-		src[#src + 1] = "\telse"
-		src[#src + 1] = "\t\tif obj then obj[prop] = val end"
-		src[#src + 1] = "\tend"
-		src[#src + 1] = "end"
-		src[#src + 1] = ""
-
-		-- tweenProperty utility (still needed for camera FOV folder)
-		src[#src + 1] = "local function tweenProperty(obj, prop, fromVal, toVal, delayTime, dur, style, dir)"
-		src[#src + 1] = "\tlocal function go()"
-		src[#src + 1] = "\t\tif not obj then return end"
-		src[#src + 1] = "\t\tobj[prop] = fromVal"
-		src[#src + 1] = "\t\tTweenService:Create(obj, TweenInfo.new(dur, Enum.EasingStyle[style], Enum.EasingDirection[dir]), {[prop] = toVal}):Play()"
-		src[#src + 1] = "\tend"
-		src[#src + 1] = "\tif delayTime > 0 then task.delay(delayTime, go) else go() end"
-		src[#src + 1] = "end"
-		src[#src + 1] = ""
-
-		-- playKeyframes engine
-		src[#src + 1] = "local function playKeyframes(obj, prop, propType, keyframes, baseRoot)"
-		src[#src + 1] = "\tfor i = 1, #keyframes do"
-		src[#src + 1] = "\t\tlocal kf = keyframes[i]"
-		src[#src + 1] = "\t\tlocal nextKf = keyframes[i + 1]"
-		src[#src + 1] = "\t\tlocal t, v, style, dir = kf[1], kf[2], kf[3], kf[4]"
-		src[#src + 1] = "\t\tif not nextKf then"
-		src[#src + 1] = "\t\t\tsetProperty(obj, prop, v, t)"
-		src[#src + 1] = "\t\t\tbreak"
-		src[#src + 1] = "\t\tend"
-		src[#src + 1] = "\t\tlocal t2, v2 = nextKf[1], nextKf[2]"
-		src[#src + 1] = "\t\tlocal dur = math.max(0.001, t2 - t)"
-		src[#src + 1] = "\t\tlocal info = TweenInfo.new(dur, Enum.EasingStyle[style], Enum.EasingDirection[dir])"
-		src[#src + 1] = "\t\tlocal function go()"
-		src[#src + 1] = "\t\t\tif not obj then return end"
-		src[#src + 1] = "\t\t\tif propType == 'boolean' then"
-		src[#src + 1] = "\t\t\t\tobj[prop] = v"
-		src[#src + 1] = "\t\t\telseif propType == 'NumberSequence' then"
-		src[#src + 1] = "\t\t\t\tlocal nv = Instance.new('NumberValue'); nv.Value = v"
-		src[#src + 1] = "\t\t\t\tnv.Changed:Connect(function(val) if obj then obj[prop] = NumberSequence.new({NumberSequenceKeypoint.new(0, val), NumberSequenceKeypoint.new(1, val)}) end end)"
-		src[#src + 1] = "\t\t\t\tlocal tw = TweenService:Create(nv, info, {Value = v2})"
-		src[#src + 1] = "\t\t\t\ttw.Completed:Once(function() nv:Destroy() end); tw:Play()"
-		src[#src + 1] = "\t\t\telseif propType == 'ColorSequence' then"
-		src[#src + 1] = "\t\t\t\tlocal cv = Instance.new('Color3Value'); cv.Value = v"
-		src[#src + 1] = "\t\t\t\tcv.Changed:Connect(function(val) if obj then obj[prop] = ColorSequence.new(val) end end)"
-		src[#src + 1] = "\t\t\t\tlocal tw = TweenService:Create(cv, info, {Value = v2})"
-		src[#src + 1] = "\t\t\t\ttw.Completed:Once(function() cv:Destroy() end); tw:Play()"
-		src[#src + 1] = "\t\t\telseif propType == 'RelCFrame' then"
-		src[#src + 1] = "\t\t\t\tif baseRoot then"
-		src[#src + 1] = "\t\t\t\t\tlocal nv = Instance.new('NumberValue'); nv.Value = 0; local conn"
-		src[#src + 1] = "\t\t\t\t\tconn = nv.Changed:Connect(function(a) if obj and baseRoot then obj.CFrame = baseRoot.CFrame * v:Lerp(v2, a) end end)"
-		src[#src + 1] = "\t\t\t\t\tlocal tw = TweenService:Create(nv, info, {Value = 1})"
-		src[#src + 1] = "\t\t\t\t\ttw.Completed:Once(function() conn:Disconnect() nv:Destroy() end); tw:Play()"
-		src[#src + 1] = "\t\t\t\tend"
-		src[#src + 1] = "\t\t\telse"
-		src[#src + 1] = "\t\t\t\tobj[prop] = v"
-		src[#src + 1] = "\t\t\t\tTweenService:Create(obj, info, {[prop] = v2}):Play()"
-		src[#src + 1] = "\t\t\tend"
-		src[#src + 1] = "\t\tend"
-		src[#src + 1] = "\t\tif t > 0 then task.delay(t, go) else go() end"
-		src[#src + 1] = "\tend"
-		src[#src + 1] = "end"
-		src[#src + 1] = ""
-
-		-- safeEmit utility
-		src[#src + 1] = "local function safeEmit(instance, count)"
-		src[#src + 1] = "\tif instance and instance:IsA('ParticleEmitter') then instance:Emit(count) end"
-		src[#src + 1] = "end"
-		src[#src + 1] = ""
-
 		-- Play function
 		src[#src + 1] = "function module.Play(rootPart, offset, lifeTime, config)"
 		src[#src + 1] = "\tconfig = config or {}"
@@ -1014,7 +1986,9 @@ generateBtn.Click:Connect(function()
 		src[#src + 1] = "\tlifeTime = lifeTime or 10"
 		src[#src + 1] = "\tlocal sizeMulti = config.SizeMulti or 1"
 		src[#src + 1] = "\tlocal autoPlayAnimations = (config.AutoPlayAnimations ~= false) -- defaults to true"
-		src[#src + 1] = "\tlocal playCutscene = (config.PlayCutscene ~= false) -- defaults to true"
+		if includeCutscene then
+			src[#src + 1] = "\tlocal playCutscene = (config.PlayCutscene ~= false) -- defaults to true"
+		end
 		src[#src + 1] = ""
 		src[#src + 1] = "\tlocal model = script.Parent:Clone()"
 		src[#src + 1] = "\tlocal selfModule = model:FindFirstChild('VFXPlayer')"
@@ -1023,33 +1997,37 @@ generateBtn.Click:Connect(function()
 		src[#src + 1] = "\tlocal baseRoot = model:FindFirstChild('RootPart')"
 		src[#src + 1] = "\tlocal animationTracks = {}"
 		src[#src + 1] = ""
-		src[#src + 1] = "\t-- === Save original state for restoration ==="
-		src[#src + 1] = "\tlocal _Lighting = game:GetService('Lighting')"
-		src[#src + 1] = "\tlocal _savedLighting = {}"
-		src[#src + 1] =
-			"\tfor _, prop in ipairs({'Ambient','OutdoorAmbient','Brightness','ColorShift_Bottom','ColorShift_Top','FogColor','FogEnd','FogStart','EnvironmentDiffuseScale','EnvironmentSpecularScale','ExposureCompensation'}) do"
-		src[#src + 1] = "\t\tpcall(function() _savedLighting[prop] = _Lighting[prop] end)"
-		src[#src + 1] = "\tend"
-		src[#src + 1] = "\tlocal _savedCameraFOV = workspace.CurrentCamera.FieldOfView"
-		src[#src + 1] = "\tlocal _savedAtmospheres = {}"
-		src[#src + 1] = "\tfor _, child in ipairs(_Lighting:GetChildren()) do"
-		src[#src + 1] = "\t\tif child:IsA('Atmosphere') then"
-		src[#src + 1] =
-			"\t\t\t_savedAtmospheres[child] = {Density=child.Density, Offset=child.Offset, Color=child.Color, Decay=child.Decay, Glare=child.Glare, Haze=child.Haze}"
-		src[#src + 1] = "\t\tend"
-		src[#src + 1] = "\tend"
-		src[#src + 1] = ""
-		src[#src + 1] = "\tlocal function _restoreState()"
-		src[#src + 1] = "\t\tfor prop, val in pairs(_savedLighting) do"
-		src[#src + 1] = "\t\t\tpcall(function() _Lighting[prop] = val end)"
-		src[#src + 1] = "\t\tend"
-		src[#src + 1] = "\t\tworkspace.CurrentCamera.FieldOfView = _savedCameraFOV"
-		src[#src + 1] = "\t\tfor atm, props in pairs(_savedAtmospheres) do"
-		src[#src + 1] = "\t\t\tif atm and atm.Parent then"
-		src[#src + 1] = "\t\t\t\tfor p, v in pairs(props) do pcall(function() atm[p] = v end) end"
-		src[#src + 1] = "\t\t\tend"
-		src[#src + 1] = "\t\tend"
-		src[#src + 1] = "\tend"
+		if includeCutscene then
+			src[#src + 1] = "\t-- === Save original state for restoration ==="
+			src[#src + 1] = "\tlocal _Lighting = game:GetService('Lighting')"
+			src[#src + 1] = "\tlocal _savedLighting = {}"
+			src[#src + 1] =
+				"\tfor _, prop in ipairs({'Ambient','OutdoorAmbient','Brightness','ColorShift_Bottom','ColorShift_Top','FogColor','FogEnd','FogStart','EnvironmentDiffuseScale','EnvironmentSpecularScale','ExposureCompensation'}) do"
+			src[#src + 1] = "\t\tpcall(function() _savedLighting[prop] = _Lighting[prop] end)"
+			src[#src + 1] = "\tend"
+			src[#src + 1] = "\tlocal _savedCameraFOV = workspace.CurrentCamera.FieldOfView"
+			src[#src + 1] = "\tlocal _savedAtmospheres = {}"
+			src[#src + 1] = "\tfor _, child in ipairs(_Lighting:GetChildren()) do"
+			src[#src + 1] = "\t\tif child:IsA('Atmosphere') then"
+			src[#src + 1] =
+				"\t\t\t_savedAtmospheres[child] = {Density=child.Density, Offset=child.Offset, Color=child.Color, Decay=child.Decay, Glare=child.Glare, Haze=child.Haze}"
+			src[#src + 1] = "\t\tend"
+			src[#src + 1] = "\tend"
+			src[#src + 1] = ""
+			src[#src + 1] = "\tlocal function _restoreState()"
+			src[#src + 1] = "\t\tfor prop, val in pairs(_savedLighting) do"
+			src[#src + 1] = "\t\t\tpcall(function() _Lighting[prop] = val end)"
+			src[#src + 1] = "\t\tend"
+			src[#src + 1] = "\t\tworkspace.CurrentCamera.FieldOfView = _savedCameraFOV"
+			src[#src + 1] = "\t\tfor atm, props in pairs(_savedAtmospheres) do"
+			src[#src + 1] = "\t\t\tif atm and atm.Parent then"
+			src[#src + 1] = "\t\t\t\tfor p, v in pairs(props) do pcall(function() atm[p] = v end) end"
+			src[#src + 1] = "\t\t\tend"
+			src[#src + 1] = "\t\tend"
+			src[#src + 1] = "\tend"
+		else
+			src[#src + 1] = "\tlocal function _restoreState() end"
+		end
 		src[#src + 1] = ""
 		src[#src + 1] = "\tif rootPart and typeof(rootPart) == 'Instance' and rootPart:IsA('BasePart') then"
 		src[#src + 1] = "\t\tlocal endTime = os.clock() + lifeTime"
@@ -1107,25 +2085,27 @@ generateBtn.Click:Connect(function()
 		src[#src + 1] = ""
 
 		-- Group type handling (CameraEffect → Camera, Vignette → PlayerGui)
-		src[#src + 1] = "\t-- === Special Instance Handling (Camera Effects, UI) ==="
-		src[#src + 1] = "\tfor _, item in pairs(model:GetChildren()) do"
-		src[#src + 1] = "\t\tlocal groupType = item:GetAttribute('GroupType')"
-		src[#src + 1] = "\t\tif groupType == 'CameraEffect' then"
-		src[#src + 1] = "\t\t\titem.Parent = workspace.CurrentCamera"
-		src[#src + 1] = "\t\t\tmodel.AncestryChanged:Once(function()"
-		src[#src + 1] = "\t\t\t\tDebris:AddItem(item, 0)"
-		src[#src + 1] = "\t\t\tend)"
-		src[#src + 1] = "\t\telseif groupType == 'Vignette' or groupType == 'ScreenCover' then"
-		src[#src + 1] = "\t\t\tif Players.LocalPlayer then"
-		src[#src + 1] = "\t\t\t\tlocal pg = Players.LocalPlayer:FindFirstChild('PlayerGui')"
-		src[#src + 1] = "\t\t\t\tif pg then item.Parent = pg end"
-		src[#src + 1] = "\t\t\t\tmodel.AncestryChanged:Once(function()"
-		src[#src + 1] = "\t\t\t\t\tDebris:AddItem(item, 0)"
-		src[#src + 1] = "\t\t\t\tend)"
-		src[#src + 1] = "\t\t\tend"
-		src[#src + 1] = "\t\tend"
-		src[#src + 1] = "\tend"
-		src[#src + 1] = ""
+		if includeCutscene then
+			src[#src + 1] = "\t-- === Special Instance Handling (Camera Effects, UI) ==="
+			src[#src + 1] = "\tfor _, item in pairs(model:GetChildren()) do"
+			src[#src + 1] = "\t\tlocal groupType = item:GetAttribute('GroupType')"
+			src[#src + 1] = "\t\tif groupType == 'CameraEffect' then"
+			src[#src + 1] = "\t\t\titem.Parent = workspace.CurrentCamera"
+			src[#src + 1] = "\t\t\tmodel.AncestryChanged:Once(function()"
+			src[#src + 1] = "\t\t\t\tDebris:AddItem(item, 0)"
+			src[#src + 1] = "\t\t\tend)"
+			src[#src + 1] = "\t\telseif groupType == 'Vignette' or groupType == 'ScreenCover' then"
+			src[#src + 1] = "\t\t\tif Players.LocalPlayer then"
+			src[#src + 1] = "\t\t\t\tlocal pg = Players.LocalPlayer:FindFirstChild('PlayerGui')"
+			src[#src + 1] = "\t\t\t\tif pg then item.Parent = pg end"
+			src[#src + 1] = "\t\t\t\tmodel.AncestryChanged:Once(function()"
+			src[#src + 1] = "\t\t\t\t\tDebris:AddItem(item, 0)"
+			src[#src + 1] = "\t\t\t\tend)"
+			src[#src + 1] = "\t\t\tend"
+			src[#src + 1] = "\t\tend"
+			src[#src + 1] = "\tend"
+			src[#src + 1] = ""
+		end
 
 		-- === Animation auto-play ===
 		if #detectedRigs > 0 then
@@ -1252,7 +2232,7 @@ generateBtn.Click:Connect(function()
 			end
 		end
 
-		if #cameraFOVKeyframes > 0 or #cameraOtherAnims > 0 or hasCutscene then
+		if includeCutscene and (#cameraFOVKeyframes > 0 or #cameraOtherAnims > 0 or hasCutscene) then
 			src[#src + 1] = "\tlocal function setupCamera()"
 			src[#src + 1] = "\t\tlocal camera = workspace.CurrentCamera"
 			src[#src + 1] = ""
@@ -1362,7 +2342,7 @@ generateBtn.Click:Connect(function()
 		end
 		print(
 			">> Generated VFX Module for:",
-			SaveOBJ.Name,
+			Source.name,
 			"("
 				.. #moduleAnimBuffer
 				.. " anim lines, "
@@ -1377,6 +2357,14 @@ generateBtn.Click:Connect(function()
 
 	Selection:Set(ForcedSelection)
 	warn(">> VFX Module generation complete!")
+end
+
+generateBtn.Click:Connect(function()
+	runGeneration(true)
+end)
+
+generateNoCutsceneBtn.Click:Connect(function()
+	runGeneration(false)
 end)
 ]]></ProtectedString>
 			<bool name="Disabled">false</bool>
@@ -1386,7 +2374,7 @@ end)
 			<BinaryString name="AttributesSerialize"></BinaryString>
 			<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
 			<bool name="DefinesCapabilities">false</bool>
-			<string name="Name">MeshEmitterPlugIn (v3.1.5)</string>
+			<string name="Name">HamVFX (v3.4.0)</string>
 			<int64 name="SourceAssetId">-1</int64>
 			<BinaryString name="Tags"></BinaryString>
 		</Properties>
