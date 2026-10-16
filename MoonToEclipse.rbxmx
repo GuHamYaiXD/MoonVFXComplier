@@ -1,0 +1,2203 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+	<External>null</External>
+	<External>nil</External>
+	<Item class="Script" referent="RBX3A63677E7DC94F45B54A9106E1AB8C76">
+		<Properties>
+			<ProtectedString name="Source"><![CDATA[-- Moon → Eclipse
+-- Converts Moon Animator 2 saves (ServerStorage.MoonAnimator2Saves) into Eclipse Animator
+-- projects (ServerStorage["Eclipse Animator Saves"].EclipseAnimator_Saves).
+--
+-- Joints, rig/part/model/lighting property tracks, the camera (CFrame + FOV), easing
+-- (style, direction, Back/Elastic params) and events (markers, codeBegin/codeEnd, sounds,
+-- action tracks) are written in Eclipse's own storage format, so Eclipse opens the result
+-- like a project it saved itself.
+
+-- || Services || --
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local HttpService = game:GetService("HttpService")
+local ServerStorage = game:GetService("ServerStorage")
+local Selection = game:GetService("Selection")
+
+-- || Constants || --
+local MOON_ROOT = "MoonAnimator2Saves"
+local ECLIPSE_ROOT = "Eclipse Animator Saves"
+local ECLIPSE_SAVES = "EclipseAnimator_Saves"
+local CAMERA_DEPTH = 1.2 -- Eclipse renders the camera 1.2 studs in front of its CamPart pose
+local CHUNK = 150000
+
+local LINEAR = { Type = "Linear", Direction = "In" }
+
+local EASE_STYLES = {
+	Linear = true,
+	Constant = true,
+	Sine = true,
+	Quad = true,
+	Cubic = true,
+	Quart = true,
+	Quint = true,
+	Sextic = true,
+	Expo = true,
+	Circ = true,
+	Back = true,
+	Bounce = true,
+	Elastic = true,
+}
+
+local EASE_DIRECTIONS = { In = true, Out = true, InOut = true, OutIn = true }
+
+-- ============================================================
+-- Moon Animator 2 reader
+-- ============================================================
+
+local Moon = {}
+
+local function numericChildren(folder)
+	local list = {}
+	if not folder then
+		return list
+	end
+	for _, child in ipairs(folder:GetChildren()) do
+		local n = tonumber(child.Name)
+		if n then
+			table.insert(list, { index = n, instance = child })
+		end
+	end
+	table.sort(list, function(a, b)
+		return a.index < b.index
+	end)
+	return list
+end
+
+local function decodeJson(text)
+	local ok, decoded = pcall(HttpService.JSONDecode, HttpService, text)
+	if ok and type(decoded) == "table" then
+		return decoded
+	end
+	return nil
+end
+
+function Moon.isSave(object)
+	if not object:IsA("StringValue") then
+		return false
+	end
+	local decoded = decodeJson(object.Value)
+	return decoded ~= nil and decoded.Information ~= nil
+end
+
+function Moon.findSaves()
+	local root = ServerStorage:FindFirstChild(MOON_ROOT)
+	local saves = {}
+	local function scan(folder)
+		for _, child in ipairs(folder:GetChildren()) do
+			if child:IsA("Folder") then
+				scan(child)
+			elseif Moon.isSave(child) then
+				table.insert(saves, child)
+			end
+		end
+	end
+	if root then
+		scan(root)
+	end
+	return saves
+end
+
+function Moon.resolvePath(path)
+	if path.ItemType == "Camera" then
+		return workspace.CurrentCamera
+	end
+	local names = path.InstanceNames or {}
+	local node = game
+	for step = 2, #names do
+		local name = names[step]
+		local nextNode = node:FindFirstChild(name)
+		if not nextNode then
+			local ok, value = pcall(function()
+				return node[name]
+			end)
+			if ok and typeof(value) == "Instance" then
+				nextNode = value
+			end
+		end
+		if not nextNode then
+			return nil
+		end
+		node = nextNode
+	end
+	return node ~= game and node or nil
+end
+
+-- Moon's RigHierarchy: "_hier" key -> joint. Keys are Part1 names from the root joint down.
+function Moon.buildJointMap(rig)
+	local map = {}
+	local primary = rig:IsA("Model") and rig.PrimaryPart
+	if not primary then
+		return map
+	end
+
+	local function addBones(parentInstance, parentKey)
+		for _, bone in ipairs(parentInstance:GetChildren()) do
+			if bone.ClassName == "Bone" then
+				local key = parentKey and (parentKey .. "." .. bone.Name) or bone.Name
+				map[key] = { kind = "Bone", joint = bone }
+				addBones(bone, key)
+			end
+		end
+	end
+
+	if primary:FindFirstChildOfClass("Bone") then
+		addBones(primary, nil)
+		return map
+	end
+
+	local constraints = {}
+	for _, ac in ipairs(rig:GetDescendants()) do
+		if
+			ac.ClassName == "AnimationConstraint"
+			and ac.Attachment0
+			and ac.Attachment0.Parent
+			and ac.Attachment1
+			and ac.Attachment1.Parent
+		then
+			table.insert(constraints, ac)
+		end
+	end
+
+	local visited = {}
+	if #constraints > 0 then
+		local function walk(part, parentKey)
+			if visited[part] then
+				return
+			end
+			visited[part] = true
+			for _, ac in ipairs(constraints) do
+				if ac.Attachment0.Parent == part then
+					local part1 = ac.Attachment1.Parent
+					local key = parentKey and (parentKey .. "." .. part1.Name) or part1.Name
+					map[key] = { kind = "AnimationConstraint", joint = ac }
+					if part1:FindFirstChildOfClass("Bone") then
+						addBones(part1, key)
+					end
+					walk(part1, key)
+				end
+			end
+		end
+		walk(primary, nil)
+		return map
+	end
+
+	local motors = {}
+	for _, motor in ipairs(rig:GetDescendants()) do
+		if
+			motor.ClassName == "Motor6D"
+			and not string.find(motor.Name, "_GeoMotor6D")
+			and motor.Part0
+			and motor.Part0.Parent
+			and motor.Part1
+			and motor.Part1.Parent
+		then
+			table.insert(motors, motor)
+		end
+	end
+	local function walk(part, parentKey)
+		if visited[part] then
+			return
+		end
+		visited[part] = true
+		for _, motor in ipairs(motors) do
+			if motor.Part0 == part then
+				local key = parentKey and (parentKey .. "." .. motor.Part1.Name) or motor.Part1.Name
+				map[key] = { kind = "Motor6D", joint = motor }
+				if motor.Part1:FindFirstChildOfClass("Bone") then
+					addBones(motor.Part1, key)
+				end
+				walk(motor.Part1, key)
+			end
+		end
+	end
+	walk(primary, nil)
+	return map
+end
+
+local function readEase(easeFolder)
+	local typeValue = easeFolder:FindFirstChild("Type")
+	local params = {}
+	local folder = easeFolder:FindFirstChild("Params")
+	if folder then
+		for _, child in ipairs(folder:GetChildren()) do
+			if child:IsA("ValueBase") then
+				params[child.Name] = child.Value
+			end
+		end
+	end
+	return {
+		Type = typeValue and typeValue.Value or "Linear",
+		Direction = params.Direction,
+		Overshoot = params.Overshoot,
+		Amplitude = params.Amplitude,
+		Period = params.Period,
+	}
+end
+
+-- Values folders mark special encodings with a sibling child ("EnumType", "Vector2", ...)
+local function decodeValue(valuesFolder, holder)
+	if holder:IsA("ObjectValue") then
+		return holder.Value
+	end
+	local value = holder.Value
+	local enumType = valuesFolder:FindFirstChild("EnumType")
+	if enumType then
+		local ok, item = pcall(function()
+			return Enum[enumType.Value][value]
+		end)
+		return ok and item or value
+	end
+	if valuesFolder:FindFirstChild("Vector2") then
+		return Vector2.new(value.X, value.Y)
+	elseif valuesFolder:FindFirstChild("ColorSequence") then
+		return ColorSequence.new(value)
+	elseif valuesFolder:FindFirstChild("NumberSequence") then
+		return NumberSequence.new(value)
+	elseif valuesFolder:FindFirstChild("NumberRange") then
+		return NumberRange.new(value, value)
+	end
+	return value
+end
+
+-- `default` holders mark special encodings with a child of the holder itself
+local function decodeDefault(holder)
+	if not holder then
+		return nil
+	end
+	if holder:IsA("ObjectValue") then
+		return holder.Value
+	end
+	local value = holder.Value
+	local enumItem = holder:FindFirstChild("EnumItem")
+	if enumItem then
+		local ok, item = pcall(function()
+			return Enum[(tostring(enumItem.Value):gsub("^Enum%.", ""))][value]
+		end)
+		return ok and item or value
+	end
+	if holder:FindFirstChild("Vector2") then
+		return Vector2.new(value.X, value.Y)
+	elseif holder:FindFirstChild("ColorSequence") then
+		return ColorSequence.new(value)
+	elseif holder:FindFirstChild("NumberSequence") then
+		return NumberSequence.new(value)
+	elseif holder:FindFirstChild("NumberRange") then
+		return NumberRange.new(value, value)
+	end
+	return value
+end
+
+-- Flattens every keyframe folder into independent keys { frame, value, ease }.
+-- A folder named N holds Values["i"] at frame N + i; Eases["i"] is the outgoing ease (missing = Linear).
+function Moon.readKeys(container)
+	local keys = {}
+	for _, entry in ipairs(numericChildren(container)) do
+		local folder = entry.instance
+		local values = folder:FindFirstChild("Values")
+		if not (values and values:FindFirstChild("0")) then
+			continue
+		end
+		local eases = folder:FindFirstChild("Eases")
+		local legacyEase = (not eases) and folder:FindFirstChild("Ease")
+		local valueList = numericChildren(values)
+		local lastIndex = valueList[#valueList].index
+		for _, v in ipairs(valueList) do
+			local ease = LINEAR
+			if eases then
+				local easeFolder = eases:FindFirstChild(tostring(v.index))
+				if easeFolder then
+					ease = readEase(easeFolder)
+				end
+			elseif legacyEase and v.index == lastIndex then
+				local style = legacyEase:FindFirstChild("Style")
+				local direction = legacyEase:FindFirstChild("Direction")
+				ease = {
+					Type = style and style.Value or "Linear",
+					Direction = direction and direction.Value or "In",
+				}
+			end
+			table.insert(keys, {
+				frame = entry.index + v.index,
+				value = decodeValue(values, v.instance),
+				ease = ease,
+			})
+		end
+	end
+	table.sort(keys, function(a, b)
+		return a.frame < b.frame
+	end)
+	return keys
+end
+
+function Moon.readMarkers(markerTrack)
+	local markers = {}
+	for _, entry in ipairs(numericChildren(markerTrack)) do
+		local folder = entry.instance
+		local width = folder:FindFirstChild("width")
+		if not (folder:IsA("Folder") and width) then
+			continue
+		end
+		local function text(name)
+			local value = folder:FindFirstChild(name)
+			return value and value:IsA("StringValue") and value.Value or ""
+		end
+		local kfMarkers = {}
+		for _, kf in ipairs(numericChildren(folder:FindFirstChild("KFMarkers"))) do
+			if kf.instance:IsA("StringValue") then
+				local val = kf.instance:FindFirstChild("Val")
+				table.insert(kfMarkers, { Name = kf.instance.Value, Parameter = val and val.Value or "" })
+			end
+		end
+		table.insert(markers, {
+			frame = entry.index,
+			width = math.max(0, math.floor(tonumber(width.Value) or 0)),
+			name = text("name"),
+			codeBegin = text("codeBegin"),
+			codeEnd = text("codeEnd"),
+			kfMarkers = kfMarkers,
+		})
+	end
+	return markers
+end
+
+local UI_FLAGS = { _RigContainer_collapsed = true, _PropertyContainer_collapsed = true }
+
+function Moon.read(save)
+	local decoded = assert(decodeJson(save.Value), "Not a Moon Animator 2 save")
+	local info = decoded.Information or {}
+	local result = {
+		name = save.Name,
+		fps = math.clamp(math.floor((tonumber(info.FPS) or 60) + 0.5), 1, 1000),
+		loop = info.Looped == true,
+		priority = info.ExportPriority or "Action",
+		length = tonumber(info.Length) or 300,
+		items = {},
+		orphanMarkers = {},
+		warnings = {},
+	}
+
+	for index, entry in ipairs(decoded.Items or {}) do
+		local folder = save:FindFirstChild(tostring(index))
+		local path = entry.Path or {}
+		local label = table.concat(path.InstanceNames or {}, ".")
+		if not folder then
+			continue
+		end
+		local instance = Moon.resolvePath(path)
+		local markerTrack = folder:FindFirstChild("MarkerTrack")
+		if not instance then
+			table.insert(result.warnings, "Couldn't find " .. label .. " in the place, so its tracks were skipped.")
+			for _, marker in ipairs(Moon.readMarkers(markerTrack)) do
+				table.insert(result.orphanMarkers, marker)
+			end
+			continue
+		end
+
+		local item = {
+			index = index,
+			itemType = path.ItemType,
+			label = label,
+			instance = instance,
+			joints = {},
+			properties = {},
+			markers = {},
+		}
+
+		for _, child in ipairs(folder:GetChildren()) do
+			if UI_FLAGS[child.Name] or not child:IsA("Folder") then
+				continue
+			end
+			if child.Name == "MarkerTrack" then
+				item.markers = Moon.readMarkers(child)
+			elseif child.Name == "Rig" then
+				local jointMap = Moon.buildJointMap(instance)
+				local newFormat = child:FindFirstChild("_joint") ~= nil
+				for _, jointFolder in ipairs(child:GetChildren()) do
+					local key, default, keyContainer
+					if newFormat then
+						local hier = jointFolder:FindFirstChild("_hier")
+						if not hier then
+							continue
+						end
+						key = hier.Value
+						local defaultValue = jointFolder:FindFirstChild("default")
+						default = defaultValue and defaultValue.Value
+						keyContainer = jointFolder:FindFirstChild("_keyframes")
+					else
+						key = jointFolder.Name
+						keyContainer = jointFolder
+					end
+					local joint = jointMap[key]
+					if not joint then
+						table.insert(result.warnings, label .. ": joint '" .. key .. "' isn't in the rig anymore, so it was skipped.")
+						continue
+					end
+					if typeof(default) ~= "CFrame" then
+						if joint.kind == "Motor6D" then
+							default = joint.joint.C1
+						elseif joint.kind == "AnimationConstraint" then
+							default = joint.joint.Attachment1.CFrame
+						else
+							default = CFrame.identity
+						end
+					end
+					table.insert(item.joints, {
+						key = key,
+						kind = joint.kind,
+						joint = joint.joint,
+						default = default,
+						keys = Moon.readKeys(keyContainer),
+					})
+				end
+			else
+				table.insert(item.properties, {
+					name = child.Name,
+					default = decodeDefault(child:FindFirstChild("default")),
+					keys = Moon.readKeys(child),
+				})
+			end
+		end
+		table.insert(result.items, item)
+	end
+	return result
+end
+
+function Moon.summary(save)
+	local decoded = decodeJson(save.Value)
+	if not decoded then
+		return ""
+	end
+	local info = decoded.Information or {}
+	local items = decoded.Items or {}
+	local fps = tonumber(info.FPS) or 60
+	return string.format("%d item%s · %d frames @ %d fps", #items, #items == 1 and "" or "s", tonumber(info.Length) or 0, fps)
+end
+
+-- ============================================================
+-- Eclipse storage codecs (ported from Eclipse's ChunkStore, Document and KeyframeStorage)
+-- ============================================================
+
+local Codec = {}
+
+function Codec.writeChunks(parent, name, text)
+	local folder = Instance.new("Folder")
+	folder.Name = name
+	folder:SetAttribute("Encoding", "json-chunks-v1")
+	for start = 1, #text, CHUNK do
+		local chunk = Instance.new("StringValue")
+		chunk.Name = string.format("%06d", math.floor((start - 1) / CHUNK) + 1)
+		chunk.Value = text:sub(start, start + CHUNK - 1)
+		chunk.Parent = folder
+	end
+	folder.Parent = parent
+	return folder
+end
+
+-- Event text fields: one StringValue below 190000 bytes, otherwise 100000-byte UTF-8 safe chunks
+function Codec.writeText(parent, name, text)
+	text = text or ""
+	if #text < 190000 then
+		local value = Instance.new("StringValue")
+		value.Name = name
+		value.Value = text
+		value.Parent = parent
+		return
+	end
+	local folder = Instance.new("Folder")
+	folder.Name = name
+	local index, first = 0, 1
+	while first <= #text do
+		local last = math.min(first + 99999, #text)
+		while last < #text do
+			local byte = string.byte(text, last + 1)
+			if byte >= 0x80 and byte < 0xC0 then
+				last -= 1
+			else
+				break
+			end
+		end
+		index += 1
+		local chunk = Instance.new("StringValue")
+		chunk.Name = string.format("%06d", index)
+		chunk.Value = text:sub(first, last)
+		chunk.Parent = folder
+		first = last + 1
+	end
+	folder.Parent = parent
+end
+
+-- Typed JSON used by EclipseProperties
+local function documentEncode(value)
+	local kind = typeof(value)
+	if kind == "CFrame" then
+		return { t = "cf", v = { value:GetComponents() } }
+	elseif kind == "Vector3" then
+		return { t = "v3", v = { value.X, value.Y, value.Z } }
+	elseif kind == "Color3" then
+		return { t = kind, v = { value.R, value.G, value.B } }
+	elseif kind == "Vector2" then
+		return { t = kind, v = { value.X, value.Y } }
+	elseif kind == "NumberRange" then
+		return { t = kind, v = { value.Min, value.Max } }
+	elseif kind == "UDim" then
+		return { t = kind, v = { value.Scale, value.Offset } }
+	elseif kind == "UDim2" then
+		return { t = kind, v = { value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset } }
+	elseif kind == "Rect" then
+		return { t = kind, v = { value.Min.X, value.Min.Y, value.Max.X, value.Max.Y } }
+	elseif kind == "BrickColor" then
+		return { t = kind, v = value.Number }
+	elseif kind == "NumberSequence" then
+		local keys = {}
+		for _, key in ipairs(value.Keypoints) do
+			table.insert(keys, { key.Time, key.Value, key.Envelope })
+		end
+		return { t = kind, v = keys }
+	elseif kind == "ColorSequence" then
+		local keys = {}
+		for _, key in ipairs(value.Keypoints) do
+			table.insert(keys, { key.Time, documentEncode(key.Value) })
+		end
+		return { t = kind, v = keys }
+	elseif kind == "EnumItem" then
+		return { t = "enum", e = (tostring(value.EnumType):gsub("^Enum%.", "")), v = value.Name }
+	elseif kind == "number" then
+		assert(value == value and math.abs(value) < math.huge, "Invalid number")
+		return value
+	elseif kind == "string" or kind == "boolean" then
+		return value
+	elseif kind ~= "table" then
+		return nil
+	end
+	local keys, entries = {}, {}
+	for key in pairs(value) do
+		if type(key) == "number" or type(key) == "string" then
+			table.insert(keys, key)
+		end
+	end
+	table.sort(keys, function(a, b)
+		if type(a) ~= type(b) then
+			return type(a) < type(b)
+		end
+		return a < b
+	end)
+	for _, key in ipairs(keys) do
+		local item = documentEncode(value[key])
+		if item ~= nil then
+			table.insert(entries, { key, item })
+		end
+	end
+	return { t = "table", v = entries }
+end
+
+function Codec.packDocument(value)
+	return HttpService:JSONEncode(documentEncode(value))
+end
+
+-- Flat key tables used by EclipseKeyframeData: {"T":[k1,v1,...]}, {"C":[...]}, {"V":[...]}, {"E":[...]}
+local function keyEncode(value)
+	local kind = typeof(value)
+	if kind == "CFrame" then
+		return { C = { value:GetComponents() } }
+	elseif kind == "Vector3" then
+		return { V = { value.X, value.Y, value.Z } }
+	elseif kind == "EnumItem" then
+		return { E = { (tostring(value.EnumType):gsub("^Enum%.", "")), value.Name } }
+	elseif kind == "number" then
+		assert(value == value and math.abs(value) < math.huge, "Non-finite keyframe value")
+		return value
+	elseif kind == "string" or kind == "boolean" then
+		return value
+	elseif kind == "table" then
+		local names = {}
+		for key in pairs(value) do
+			if type(key) == "string" or type(key) == "number" then
+				table.insert(names, key)
+			end
+		end
+		table.sort(names, function(a, b)
+			if type(a) ~= type(b) then
+				return type(a) < type(b)
+			end
+			return a < b
+		end)
+		local flat = {}
+		for _, key in ipairs(names) do
+			local encoded = keyEncode(value[key])
+			if encoded ~= nil then
+				table.insert(flat, key)
+				table.insert(flat, encoded)
+			end
+		end
+		return { T = flat }
+	end
+	return nil
+end
+
+Codec.encodeKey = keyEncode
+
+-- Same text layout as Eclipse's KeyframeStorage.encodeTracks
+function Codec.encodeTracks(tracks)
+	local out = { '{"version":2,"quaternionInterpolation":2,"tracks":[' }
+	for i, track in ipairs(tracks) do
+		if i > 1 then
+			table.insert(out, ",")
+		end
+		local metadata = table.clone(track)
+		metadata.keys = nil
+		local text = HttpService:JSONEncode(metadata)
+		table.insert(out, text:sub(1, -2))
+		table.insert(out, ',"keys":[')
+		for first = 1, #track.keys, 64 do
+			local batch = {}
+			for index = first, math.min(first + 63, #track.keys) do
+				table.insert(batch, track.keys[index])
+			end
+			if first > 1 then
+				table.insert(out, ",")
+			end
+			table.insert(out, (HttpService:JSONEncode(batch)):sub(2, -2))
+		end
+		table.insert(out, "]}")
+	end
+	table.insert(out, "]}")
+	return table.concat(out)
+end
+
+-- Path from `root` (exclusive) down to `object`: {{name, class, index}, ...}
+function Codec.pathOf(object, root)
+	local path = {}
+	local node = object
+	while node and node ~= root do
+		local parent = node.Parent
+		if not parent then
+			return nil
+		end
+		local index = 0
+		for _, child in ipairs(parent:GetChildren()) do
+			if child.Name == node.Name and child.ClassName == node.ClassName then
+				index += 1
+			end
+			if child == node then
+				break
+			end
+		end
+		table.insert(path, 1, { name = node.Name, class = node.ClassName, index = index })
+		node = parent
+	end
+	return node == root and path or nil
+end
+
+-- ============================================================
+-- Eclipse property catalog (mirrors Eclipse's Core.Properties so every track loads)
+-- ============================================================
+
+local Catalog = {}
+
+local SCHEMAS = {
+	{ "Model", { "CFrame", "Scale", "Transparency", "Color", "Reflectance" } },
+	{ "BasePart", { "CFrame", "Size", "Color", "Transparency", "Reflectance", "Material", "Anchored", "CastShadow" } },
+	{ "MeshPart", { "ApplyTexture", "ApplyMesh" } },
+	{ "SpecialMesh", { "Scale", "Offset", "VertexColor", "MeshType", "MeshId", "TextureId" } },
+	{ "Camera", { "CFrame", "FieldOfView", "Focus", "HeadScale" } },
+	{ "BlockMesh", { "Scale", "Offset", "VertexColor" } },
+	{ "SurfaceAppearance", { "Color", "ColorMap", "MetalnessMap", "NormalMap", "RoughnessMap", "AlphaMode" } },
+	{ "Shirt", { "Color3", "ShirtTemplate" } },
+	{ "Pants", { "Color3", "PantsTemplate" } },
+	{ "ShirtGraphic", { "Color3", "Graphic" } },
+	{
+		"Lighting",
+		{
+			"ClockTime",
+			"Brightness",
+			"Ambient",
+			"OutdoorAmbient",
+			"ExposureCompensation",
+			"FogEnd",
+			"FogStart",
+			"FogColor",
+			"GeographicLatitude",
+			"ColorShift_Bottom",
+			"ColorShift_Top",
+			"EnvironmentDiffuseScale",
+			"EnvironmentSpecularScale",
+			"ShadowSoftness",
+			"GlobalShadows",
+		},
+	},
+	{ "Atmosphere", { "Color", "Density", "Offset", "Haze", "Decay", "Glare" } },
+	{ "Clouds", { "Cover", "Density", "Color", "Enabled" } },
+	{ "Fire", { "Enabled", "Color", "SecondaryColor", "Size", "Heat" } },
+	{ "Sparkles", { "Enabled", "SparkleColor" } },
+	{ "Smoke", { "Enabled", "Color", "Size", "Opacity", "RiseVelocity" } },
+	{ "ForceField", { "Visible" } },
+	{ "SoundGroup", { "Volume" } },
+	{ "Attachment", { "CFrame" } },
+	{ "Light", { "Brightness", "Color", "Enabled", "Shadows" } },
+	{ "PointLight", { "Range" } },
+	{ "SpotLight", { "Range", "Angle", "Face" } },
+	{ "SurfaceLight", { "Range", "Angle", "Face" } },
+	{ "Decal", { "Texture", "Color3", "Transparency", "Face" } },
+	{ "Texture", { "OffsetStudsU", "OffsetStudsV", "StudsPerTileU", "StudsPerTileV" } },
+	{ "Sound", { "Volume", "PlaybackSpeed", "SoundId", "Looped", "RollOffMaxDistance", "RollOffMinDistance", "RollOffMode" } },
+	{
+		"ParticleEmitter",
+		{
+			"Enabled",
+			"Rate",
+			"Lifetime",
+			"Speed",
+			"Acceleration",
+			"Drag",
+			"Rotation",
+			"RotSpeed",
+			"SpreadAngle",
+			"VelocityInheritance",
+			"LightEmission",
+			"LightInfluence",
+			"ZOffset",
+			"TimeScale",
+			"Texture",
+		},
+	},
+	{
+		"Beam",
+		{
+			"Enabled",
+			"Width0",
+			"Width1",
+			"CurveSize0",
+			"CurveSize1",
+			"Texture",
+			"TextureLength",
+			"TextureSpeed",
+			"LightEmission",
+			"LightInfluence",
+			"FaceCamera",
+		},
+	},
+	{
+		"Trail",
+		{ "Enabled", "Lifetime", "MinLength", "MaxLength", "Texture", "TextureLength", "LightEmission", "LightInfluence", "FaceCamera" },
+	},
+	{ "Highlight", { "Enabled", "FillColor", "OutlineColor", "FillTransparency", "OutlineTransparency", "DepthMode" } },
+	{ "ColorCorrectionEffect", { "Enabled", "Brightness", "Contrast", "Saturation", "TintColor" } },
+	{ "BloomEffect", { "Enabled", "Intensity", "Size", "Threshold" } },
+	{ "BlurEffect", { "Enabled", "Size" } },
+	{ "DepthOfFieldEffect", { "Enabled", "FarIntensity", "FocusDistance", "InFocusRadius", "NearIntensity" } },
+	{ "SunRaysEffect", { "Enabled", "Intensity", "Spread" } },
+	{ "NumberValue", { "Value" } },
+	{ "IntValue", { "Value" } },
+	{ "BoolValue", { "Value" } },
+	{ "StringValue", { "Value" } },
+	{ "Color3Value", { "Value" } },
+	{ "Vector3Value", { "Value" } },
+	{ "CFrameValue", { "Value" } },
+}
+
+local SUPPORTED_KINDS = {
+	number = true,
+	boolean = true,
+	string = true,
+	EnumItem = true,
+	Vector2 = true,
+	Vector3 = true,
+	Color3 = true,
+	CFrame = true,
+	NumberRange = true,
+	UDim = true,
+	UDim2 = true,
+	Rect = true,
+	BrickColor = true,
+	NumberSequence = true,
+	ColorSequence = true,
+}
+
+local REFLECTION_EXCLUDED = {
+	Name = true,
+	Parent = true,
+	Archivable = true,
+	Source = true,
+	Capabilities = true,
+	Sandboxed = true,
+	UniqueId = true,
+	HistoryId = true,
+	Tags = true,
+	Attributes = true,
+}
+
+local reflectedCache = {}
+
+local function reflectedNames(className)
+	if reflectedCache[className] then
+		return reflectedCache[className]
+	end
+	local names = {}
+	local ok, properties = pcall(function()
+		return game:GetService("ReflectionService"):GetPropertiesOfClass(className)
+	end)
+	if ok then
+		for _, property in ipairs(properties) do
+			if
+				property.Permits.Write ~= nil
+				and property.Permits.Read ~= nil
+				and property.Display
+				and not property.Display.DeprecationMessage
+				and not REFLECTION_EXCLUDED[property.Name]
+				and property.Owner ~= "Instance"
+				and property.Owner ~= "Object"
+			then
+				names[property.Name] = true
+			end
+		end
+	end
+	reflectedCache[className] = names
+	return names
+end
+
+function Catalog.isAggregate(object, id)
+	return object:IsA("Model") and object.Parent ~= game and (id == "Color" or id == "Transparency" or id == "Reflectance")
+end
+
+function Catalog.readValue(object, id)
+	if object:IsA("Lighting") and (id == "ClockTime" or id == "TimeOfDay") then
+		return object.ClockTime
+	end
+	if Catalog.isAggregate(object, id) then
+		if id ~= "Color" then
+			return 0
+		end
+		for _, descendant in ipairs(object:GetDescendants()) do
+			if descendant:IsA("BasePart") then
+				return descendant.Color
+			end
+		end
+		return Color3.new(1, 1, 1)
+	end
+	if id == "ApplyMesh" then
+		return object.MeshId
+	end
+	if object:IsA("Model") and object.Parent ~= game and id == "Scale" then
+		return object:GetScale()
+	end
+	if object:IsA("Model") and object.Parent ~= game and id == "CFrame" then
+		return object:GetPivot()
+	end
+	return object[id == "ApplyTexture" and "TextureID" or id]
+end
+
+-- Objects Eclipse can keep on its timeline
+function Catalog.isTimelineObject(object)
+	if object:IsA("LuaSourceContainer") or object:IsA("Folder") or object:IsA("DataModel") then
+		return false
+	end
+	if object.Parent == game and not object:IsA("Lighting") then
+		return false
+	end
+	return true
+end
+
+-- Returns the value kind Eclipse uses for `id` on `object` (and the live value), or nil if unsupported
+function Catalog.kind(object, id)
+	if not Catalog.isTimelineObject(object) then
+		return nil
+	end
+	if object:IsA("Lighting") and id == "TimeOfDay" then
+		return nil
+	end
+	if object:IsA("Terrain") and ({ CFrame = true, Position = true, Orientation = true, PivotOffset = true, Size = true })[id] then
+		return nil
+	end
+	local listed = false
+	for _, schema in ipairs(SCHEMAS) do
+		if
+			(object:IsA(schema[1]) and not (object.Parent == game or object:IsA("Terrain")))
+			or object.ClassName == schema[1]
+		then
+			if table.find(schema[2], id) then
+				listed = true
+				break
+			end
+		end
+	end
+	if not listed then
+		if id == "TextureID" and object:IsA("MeshPart") then
+			return nil
+		end
+		listed = reflectedNames(object.ClassName)[id] == true
+	end
+	if not listed then
+		return nil
+	end
+	local ok, value = pcall(Catalog.readValue, object, id)
+	if ok and SUPPORTED_KINDS[typeof(value)] then
+		return typeof(value), value
+	end
+	return nil
+end
+
+-- Clamps a value into the range Eclipse accepts for that property (Tracks.validate)
+function Catalog.sanitize(object, id, value)
+	local kind = typeof(value)
+	if kind == "number" then
+		if value ~= value or math.abs(value) == math.huge then
+			return nil
+		end
+		if id == "Scale" then
+			value = math.clamp(value, 0.001, 10000)
+		end
+		if string.find(id, "Transparency") or id == "Reflectance" then
+			value = math.clamp(value, 0, 1)
+		end
+		if object:IsA("Lighting") and id == "ClockTime" then
+			value = math.clamp(value % 24, 0, 24)
+		end
+		if id == "FieldOfView" then
+			value = math.clamp(value, 1, 120)
+		end
+	elseif kind == "Vector3" and id == "Size" then
+		value = Vector3.new(math.max(value.X, 0.001), math.max(value.Y, 0.001), math.max(value.Z, 0.001))
+	end
+	return value
+end
+
+-- Eclipse's numeric carrier for interpolation (Tracks.encode)
+function Catalog.carrier(value)
+	local kind = typeof(value)
+	if kind == "CFrame" then
+		return value
+	elseif kind == "number" then
+		return CFrame.new(value, 0, 0)
+	elseif kind == "Vector3" then
+		return CFrame.new(value)
+	elseif kind == "Vector2" then
+		return CFrame.new(value.X, value.Y, 0)
+	elseif kind == "Color3" then
+		return CFrame.new(value.R, value.G, value.B)
+	elseif kind == "NumberRange" then
+		return CFrame.new(value.Min, value.Max, 0)
+	end
+	return CFrame.identity
+end
+
+-- Converts a Moon value into the exact kind Eclipse expects (or nil when impossible)
+function Catalog.coerce(value, kind, sample)
+	local valueKind = typeof(value)
+	if kind == "EnumItem" then
+		local enumType = typeof(sample) == "EnumItem" and sample.EnumType
+		if not enumType then
+			return nil
+		end
+		local name = valueKind == "EnumItem" and value.Name or (valueKind == "string" and value) or nil
+		if not name then
+			return nil
+		end
+		local ok, item = pcall(function()
+			return enumType[name]
+		end)
+		return ok and typeof(item) == "EnumItem" and item or nil
+	end
+	if valueKind == kind then
+		return value
+	end
+	if kind == "NumberRange" and valueKind == "number" then
+		return NumberRange.new(value, value)
+	elseif kind == "NumberSequence" and valueKind == "number" then
+		return NumberSequence.new(value)
+	elseif kind == "ColorSequence" and valueKind == "Color3" then
+		return ColorSequence.new(value)
+	elseif kind == "Vector2" and valueKind == "Vector3" then
+		return Vector2.new(value.X, value.Y)
+	elseif kind == "BrickColor" and valueKind == "Color3" then
+		return BrickColor.new(value)
+	elseif kind == "string" and valueKind == "Instance" and value:IsA("MeshPart") then
+		return value.MeshId
+	end
+	return nil
+end
+
+-- ============================================================
+-- Converter
+-- ============================================================
+
+local Converter = {}
+
+local function easeFields(ease)
+	ease = ease or LINEAR
+	local style = EASE_STYLES[ease.Type] and ease.Type or "Linear"
+	local direction = "In"
+	if style ~= "Linear" and style ~= "Constant" and EASE_DIRECTIONS[ease.Direction] then
+		direction = ease.Direction
+	end
+	local fields = {
+		EasingStyle = style,
+		EasingDirection = direction,
+		HandleType = "Vector",
+		MoonEasing = true,
+	}
+	if style == "Back" then
+		fields.Overshoot = tonumber(ease.Overshoot) or 1.70158
+	elseif style == "Elastic" then
+		fields.Amplitude = tonumber(ease.Amplitude) or 1
+		fields.Period = tonumber(ease.Period) or 0.3
+	end
+	return fields
+end
+
+local function isIdentifier(name)
+	return name:match("^[%a_][%w_]*$") ~= nil
+end
+
+-- Lua expression that reaches `instance`, e.g. workspace.Fx["Slash 1"].Beam
+local function accessor(instance)
+	local parts = {}
+	local node = instance
+	while node and node.Parent ~= game do
+		table.insert(parts, 1, node.Name)
+		node = node.Parent
+	end
+	if not node then
+		return nil
+	end
+	local code = node == workspace and "workspace" or ('game:GetService("' .. node.ClassName .. '")')
+	for _, name in ipairs(parts) do
+		if isIdentifier(name) then
+			code ..= "." .. name
+		else
+			code ..= '["' .. (name:gsub("\\", "\\\\"):gsub('"', '\\"')) .. '"]'
+		end
+	end
+	return code
+end
+
+local function literal(value)
+	local kind = typeof(value)
+	if kind == "number" then
+		return string.format("%.9g", value)
+	elseif kind == "boolean" then
+		return tostring(value)
+	elseif kind == "string" then
+		return string.format("%q", value)
+	elseif kind == "Vector3" then
+		return string.format("Vector3.new(%.9g, %.9g, %.9g)", value.X, value.Y, value.Z)
+	elseif kind == "EnumItem" then
+		return tostring(value)
+	elseif kind == "Instance" then
+		return accessor(value) or "nil"
+	end
+	return "nil"
+end
+
+-- Moon action tracks fire a call at each key; Eclipse has no action tracks, so they become event code
+local ACTIONS = {
+	Sound = {
+		Stop = function(target, v)
+			return v and target .. ":Stop()"
+		end,
+		Pause = function(target, v)
+			return v and target .. ":Pause()"
+		end,
+		Resume = function(target, v)
+			return v and target .. ":Resume()"
+		end,
+		SetTime = function(target, v)
+			return target .. ".TimePosition = " .. literal(v)
+		end,
+	},
+	ParticleEmitter = {
+		Emit = function(target, v)
+			return tonumber(v) and v > 0 and target .. ":Emit(" .. literal(v) .. ")"
+		end,
+		Clear = function(target, v)
+			return v and target .. ":Clear()"
+		end,
+	},
+	Humanoid = {
+		MoveTo = function(target, v)
+			return target .. ":MoveTo(" .. literal(v) .. ")"
+		end,
+		Move = function(target, v)
+			return target .. ":Move(" .. literal(v) .. ")"
+		end,
+		Jump = function(target, v)
+			return v and target .. ".Jump = true"
+		end,
+		Sit = function(target, v)
+			return target .. ".Sit = " .. literal(v == true)
+		end,
+		EquipTool = function(target, v)
+			return typeof(v) == "Instance" and target .. ":EquipTool(" .. literal(v) .. ")"
+		end,
+		AddAccessory = function(target, v)
+			return typeof(v) == "Instance" and target .. ":AddAccessory(" .. literal(v) .. ")"
+		end,
+		UnequipTools = function(target, v)
+			return v and target .. ":UnequipTools()"
+		end,
+		RemoveAccessories = function(target, v)
+			return v and target .. ":RemoveAccessories()"
+		end,
+		TakeDamage = function(target, v)
+			return target .. ":TakeDamage(" .. literal(v) .. ")"
+		end,
+		PlayEmote = function(target, v)
+			return target .. ":PlayEmote(" .. literal(tostring(v)) .. ")"
+		end,
+		ChangeState = function(target, v)
+			return typeof(v) == "EnumItem" and target .. ":ChangeState(" .. literal(v) .. ")"
+		end,
+		PlayAnimation = function(target, v)
+			if typeof(v) == "Instance" and v:IsA("Animation") then
+				return "do local animator = "
+					.. target
+					.. ":FindFirstChildOfClass(\"Animator\") or Instance.new(\"Animator\", "
+					.. target
+					.. ") animator:LoadAnimation("
+					.. literal(v)
+					.. "):Play() end"
+			end
+			return "for _, track in ipairs(" .. target .. ":GetPlayingAnimationTracks()) do track:Stop() end"
+		end,
+	},
+}
+
+-- Event tracks are per timeline object; Eclipse keeps one event per frame, so same-frame entries merge
+local function newEventTrack()
+	return { list = {}, byFrame = {} }
+end
+
+local function eventAt(track, frame)
+	local event = track.byFrame[frame]
+	if not event then
+		event = { Frame = frame, Duration = 0, Markers = {}, CodeBegin = {}, CodeEnd = {}, Sounds = {} }
+		track.byFrame[frame] = event
+		table.insert(track.list, event)
+	end
+	return event
+end
+
+local function addMarker(track, marker, notes)
+	local event = eventAt(track, marker.frame)
+	event.Duration = math.max(event.Duration, marker.width)
+	if #marker.kfMarkers > 0 then
+		for _, pair in ipairs(marker.kfMarkers) do
+			table.insert(event.Markers, pair)
+		end
+		if marker.name ~= "" then
+			table.insert(notes, string.format("Event at frame %d: Moon's keyframe name '%s' was dropped (Eclipse events export KeyframeMarkers only).", marker.frame, marker.name))
+		end
+	elseif marker.name ~= "" then
+		table.insert(event.Markers, { Name = marker.name, Parameter = "" })
+	end
+	if marker.codeBegin ~= "" then
+		table.insert(event.CodeBegin, marker.codeBegin)
+	end
+	if marker.codeEnd ~= "" then
+		table.insert(event.CodeEnd, marker.codeEnd)
+	end
+end
+
+local function writeEvents(target, track, fps, enabled)
+	local folder = Instance.new("Folder")
+	folder.Name = "EclipseEvents"
+	folder:SetAttribute("Version", 8)
+	folder:SetAttribute("ProjectSubtitles", false)
+	folder:SetAttribute("FacesEnabled", false)
+	Codec.writeText(folder, "FaceKeys", "[]")
+	folder:SetAttribute("FPS", fps)
+	folder:SetAttribute("DefaultFPS", 60)
+	folder:SetAttribute("VFXFollowsFPS", true)
+	folder:SetAttribute("Enabled", enabled)
+	folder:SetAttribute("Revision", 0)
+	table.sort(track.list, function(a, b)
+		return a.Frame < b.Frame
+	end)
+	for _, event in ipairs(track.list) do
+		local item = Instance.new("Folder")
+		item.Name = HttpService:GenerateGUID(false)
+		item:SetAttribute("Frame", event.Frame)
+		item:SetAttribute("Duration", event.Duration)
+		item:SetAttribute("Speed", 1)
+		local first = event.Markers[1]
+		item:SetAttribute("EventName", first and first.Name or "")
+		item:SetAttribute("Parameter", first and first.Parameter or "")
+		item:SetAttribute("Enabled", true)
+		Codec.writeText(item, "Markers", HttpService:JSONEncode(event.Markers))
+		Codec.writeText(item, "CodeBegin", table.concat(event.CodeBegin, "\n"))
+		Codec.writeText(item, "CodeEnd", table.concat(event.CodeEnd, "\n"))
+		local sounds = Instance.new("Folder")
+		sounds.Name = "Sounds"
+		for index, sound in ipairs(event.Sounds) do
+			local entry = Instance.new("Folder")
+			entry.Name = string.format("%06d", index)
+			entry:SetAttribute("AudioId", sound.AudioId)
+			entry:SetAttribute("Volume", sound.Volume)
+			entry:SetAttribute("Speed", sound.Speed)
+			entry:SetAttribute("Duration", sound.Duration)
+			entry.Parent = sounds
+		end
+		sounds.Parent = item
+		Codec.writeText(item, "Emits", "[]")
+		item.Parent = folder
+	end
+	folder.Parent = target
+	return folder
+end
+
+-- Rest C0 Eclipse uses for a joint (its DefaultPose), and the Part1 its tracks are addressed by
+local function jointRest(joint)
+	if joint.kind == "Motor6D" then
+		local stamp = joint.joint:GetAttribute("EclipseAnimatorDefaultC0")
+		return typeof(stamp) == "CFrame" and stamp or joint.joint.C0, joint.joint.Part1
+	elseif joint.kind == "AnimationConstraint" then
+		local constraint = joint.joint
+		return constraint.Attachment0.CFrame * constraint.Transform, constraint.Attachment1.Parent
+	end
+	return joint.joint.CFrame, joint.joint
+end
+
+-- Moon stores the C1 (or Attachment1.CFrame / Bone.Transform) to apply. Eclipse stores the C0 to apply.
+-- Same world pose: C0 = rest * T, where T = value:Inverse() * default (Bone: T = value).
+local function jointC0(joint, rest, value)
+	if joint.kind == "Bone" then
+		return (rest * value):Orthonormalize()
+	end
+	return (rest * (value:Inverse() * joint.default)):Orthonormalize()
+end
+
+local function jointKeyData(c0, ease)
+	local data = easeFields(ease)
+	data.C0 = c0
+	data.Parented = true
+	data.QuaternionInterpolationVersion = 2
+	data._EclipseDerivedPose = true
+	return keyEncode(data)
+end
+
+local function buildJointTrack(rig, joint, report)
+	if #joint.keys == 0 then
+		return nil
+	end
+	local rest, part1 = jointRest(joint)
+	local path = part1 and Codec.pathOf(part1, rig)
+	if not path then
+		table.insert(report.warnings, rig.Name .. ": joint '" .. joint.key .. "' isn't inside the rig model, so it was skipped.")
+		return nil
+	end
+
+	-- Moon puts the rig back to its saved rest C1 when it closes; do the same so Eclipse's pose matches
+	if joint.kind == "Motor6D" and not joint.joint.C1:FuzzyEq(joint.default, 1e-4) then
+		joint.joint.C1 = joint.default
+		table.insert(report.notes, rig.Name .. ": reset " .. joint.joint.Name .. ".C1 to Moon's saved rest pose.")
+	elseif joint.kind == "AnimationConstraint" and not joint.joint.Attachment1.CFrame:FuzzyEq(joint.default, 1e-4) then
+		joint.joint.Attachment1.CFrame = joint.default
+		table.insert(report.notes, rig.Name .. ": reset " .. joint.joint.Name .. " Attachment1 to Moon's saved rest pose.")
+	end
+
+	local track = { path = path, rest = keyEncode(rest), parented = true, keys = {} }
+	if joint.kind == "Motor6D" then
+		local incoming = 0
+		for _, descendant in ipairs(rig:GetDescendants()) do
+			if descendant:IsA("Motor6D") and descendant.Part1 == part1 then
+				incoming += 1
+			end
+		end
+		if incoming > 1 then
+			track.jointPath = Codec.pathOf(joint.joint, rig)
+		end
+	end
+
+	-- Moon blends from the rest pose at frame 0 into a later first key
+	if joint.keys[1].frame > 0 then
+		table.insert(track.keys, { frame = 0, data = jointKeyData(jointC0(joint, rest, joint.default), LINEAR) })
+	end
+	for _, key in ipairs(joint.keys) do
+		if typeof(key.value) == "CFrame" then
+			table.insert(track.keys, { frame = key.frame, data = jointKeyData(jointC0(joint, rest, key.value), key.ease) })
+		end
+	end
+	report.keys += #track.keys
+	return track
+end
+
+local function propertyKey(value, ease)
+	local carrier = Catalog.carrier(value)
+	local data = easeFields(ease)
+	data.C0 = carrier
+	data.PropertyValue = value
+	data.Position = carrier.Position
+	data.Rotation = carrier.Rotation
+	data.Parented = true
+	data.QuaternionInterpolationVersion = 2
+	return data
+end
+
+-- Moon-specific property semantics that differ from Eclipse's
+local function eclipseValue(item, propertyName, value, scaleBase)
+	local object = item.instance
+	if propertyName == "CFrame" and typeof(value) == "CFrame" and item.itemType == "Rig" and object.PrimaryPart then
+		-- Moon moves the rig's PrimaryPart; Eclipse moves the model pivot
+		return value * object.PrimaryPart.PivotOffset
+	end
+	if propertyName == "Scale" and object:IsA("Model") and typeof(value) == "number" then
+		-- Moon's scale is relative to the size the model had when the file was opened
+		return value * scaleBase
+	end
+	return value
+end
+
+local function buildPropertyRow(item, property, report)
+	-- Moon ignores tracks without keys, so they aren't carried over
+	if #property.keys == 0 then
+		return nil
+	end
+	local object = item.instance
+	local id = property.name
+	local kind, live = Catalog.kind(object, id)
+	if not kind then
+		return nil, "isn't a property Eclipse can animate on " .. object.ClassName
+	end
+	local scaleBase = object:IsA("Model") and object:GetScale() or 1
+
+	local function convert(value)
+		value = eclipseValue(item, id, value, scaleBase)
+		value = Catalog.coerce(value, kind, live)
+		if value == nil then
+			return nil
+		end
+		return Catalog.sanitize(object, id, value)
+	end
+
+	local default = property.default ~= nil and convert(property.default) or nil
+	if default == nil then
+		default = Catalog.sanitize(object, id, live)
+	end
+	if default == nil then
+		return nil, "has no usable default value"
+	end
+
+	local keys = {}
+	local count = 0
+	local firstFrame
+	for _, key in ipairs(property.keys) do
+		local value = convert(key.value)
+		if value ~= nil then
+			keys[key.frame] = propertyKey(value, key.ease)
+			count += 1
+			firstFrame = firstFrame and math.min(firstFrame, key.frame) or key.frame
+		end
+	end
+	if count == 0 then
+		return nil, "has values Eclipse can't store (" .. typeof(property.keys[1].value) .. ")"
+	end
+	-- Moon blends (or holds, for bool/string/enum) from the track default before the first key
+	if firstFrame and firstFrame > 0 then
+		keys[0] = propertyKey(default, LINEAR)
+		count += 1
+	end
+	report.keys += count
+	return {
+		id = id,
+		default = default,
+		enabled = true,
+		disabled = false,
+		keys = keys,
+	}
+end
+
+local function soundEvent(sound)
+	local length = 0
+	pcall(function()
+		length = sound.TimeLength
+	end)
+	return {
+		AudioId = sound.SoundId,
+		Volume = math.clamp(sound.Volume, 0, 10),
+		Speed = math.clamp(sound.PlaybackSpeed, 0.01, 20),
+		Duration = math.clamp(length, 0, 86400),
+	}
+end
+
+-- Turns Moon action tracks into events on the object's own track
+local function convertActions(item, property, events, report)
+	local object = item.instance
+	if object:IsA("Sound") and (property.name == "Play" or property.name == "PlayOnce") then
+		for _, key in ipairs(property.keys) do
+			if key.value == true then
+				table.insert(eventAt(events, key.frame).Sounds, soundEvent(object))
+			end
+		end
+		return true
+	end
+	local class = object:IsA("Sound") and "Sound"
+		or object:IsA("ParticleEmitter") and "ParticleEmitter"
+		or object:IsA("Humanoid") and "Humanoid"
+	local action = class and ACTIONS[class][property.name]
+	if not action then
+		return false
+	end
+	local target = accessor(object)
+	if not target then
+		return false
+	end
+	for _, key in ipairs(property.keys) do
+		local code = action(target, key.value)
+		if code then
+			table.insert(eventAt(events, key.frame).CodeBegin, code)
+		end
+	end
+	table.insert(report.notes, item.label .. ": Moon '" .. property.name .. "' keys became event code (Eclipse runs it in its cutscene runtime and HamVFX).")
+	return true
+end
+
+local ACTION_NAMES = {
+	PlayOnce = true,
+	Play = true,
+	Stop = true,
+	Pause = true,
+	Resume = true,
+	SetTime = true,
+	Emit = true,
+	Clear = true,
+	PlayAnimation = true,
+	MoveTo = true,
+	Move = true,
+	Jump = true,
+	Sit = true,
+	EquipTool = true,
+	AddAccessory = true,
+	UnequipTools = true,
+	RemoveAccessories = true,
+	TakeDamage = true,
+	PlayEmote = true,
+	ChangeState = true,
+}
+
+local function cameraEntry(item, report)
+	local cframe, fov
+	for _, property in ipairs(item.properties) do
+		if property.name == "CFrame" then
+			cframe = property
+		elseif property.name == "FieldOfView" then
+			fov = property
+		elseif #property.keys > 0 then
+			table.insert(report.warnings, "Camera '" .. property.name .. "' keys were skipped (Eclipse's camera has no matching track).")
+		end
+	end
+
+	local restView = cframe and typeof(cframe.default) == "CFrame" and cframe.default
+		or cframe and cframe.keys[1] and cframe.keys[1].value
+		or workspace.CurrentCamera.CFrame
+	local root = restView * CFrame.new(0, 0, CAMERA_DEPTH)
+	local defaultFov = math.clamp(fov and tonumber(fov.default) or 70, 1, 120)
+
+	local tracks = {}
+	local function addTrack(partName, property, toC0)
+		if not property or #property.keys == 0 then
+			return
+		end
+		local track = { path = { { name = partName, class = "Part", index = 1 } }, rest = keyEncode(CFrame.identity), parented = true, keys = {} }
+		if property.keys[1].frame > 0 and property.default ~= nil then
+			local c0 = toC0(property.default)
+			if c0 then
+				table.insert(track.keys, { frame = 0, data = jointKeyData(c0, LINEAR) })
+			end
+		end
+		for _, key in ipairs(property.keys) do
+			local c0 = toC0(key.value)
+			if c0 then
+				table.insert(track.keys, { frame = key.frame, data = jointKeyData(c0, key.ease) })
+			end
+		end
+		report.keys += #track.keys
+		table.insert(tracks, track)
+	end
+
+	addTrack("CamPart", cframe, function(value)
+		return typeof(value) == "CFrame" and (root:Inverse() * value * CFrame.new(0, 0, CAMERA_DEPTH)):Orthonormalize()
+	end)
+	addTrack("FovPart", fov, function(value)
+		return tonumber(value) and CFrame.new(0, math.clamp(value, 1, 120) - defaultFov, 0)
+	end)
+
+	return {
+		camera = true,
+		root = root,
+		defaultFov = defaultFov,
+		tracks = tracks,
+	}
+end
+
+local function uniqueName(parent, base)
+	if not parent:FindFirstChild(base) then
+		return base
+	end
+	local candidate = base .. " (Moon)"
+	local index = 2
+	while parent:FindFirstChild(candidate) do
+		candidate = base .. " (Moon " .. index .. ")"
+		index += 1
+	end
+	return candidate
+end
+
+local function ensureFolder(parent, name)
+	local folder = parent:FindFirstChild(name)
+	if folder and folder:IsA("Folder") then
+		return folder
+	end
+	folder = Instance.new("Folder")
+	folder.Name = name
+	folder.Parent = parent
+	return folder
+end
+
+local function trackId(object)
+	local id = object:GetAttribute("EclipseTrackId")
+	if typeof(id) ~= "string" or id == "" then
+		id = HttpService:GenerateGUID(false)
+		object:SetAttribute("EclipseTrackId", id)
+	end
+	return id
+end
+
+local function validPriority(name)
+	local ok, item = pcall(function()
+		return Enum.AnimationPriority[name]
+	end)
+	return ok and item or Enum.AnimationPriority.Action
+end
+
+-- Converts one Moon save. Returns the new project folder (or nil) and a report.
+function Converter.convert(save)
+	local report = { name = save.Name, keys = 0, objects = 0, events = 0, warnings = {}, notes = {} }
+	local moon = Moon.read(save)
+	for _, warning in ipairs(moon.warnings) do
+		table.insert(report.warnings, warning)
+	end
+
+	local priority = validPriority(moon.priority)
+	local fps = moon.fps
+	local lastFrame = 0
+	local entries = {}
+	local usedNames = {}
+	local primaryEvents
+
+	local function noteFrame(frame)
+		lastFrame = math.max(lastFrame, frame)
+	end
+
+	-- Moon lists item "n" at the top of its timeline; rigs with joint keys go first in Eclipse
+	local ordered = table.clone(moon.items)
+	table.sort(ordered, function(a, b)
+		local aRig, bRig = #a.joints > 0, #b.joints > 0
+		if aRig ~= bRig then
+			return aRig
+		end
+		return a.index > b.index
+	end)
+
+	local cameraItem
+	for _, item in ipairs(ordered) do
+		local object = item.instance
+		if item.itemType == "Camera" then
+			cameraItem = item
+			continue
+		end
+		if object:IsDescendantOf(game:GetService("CoreGui")) then
+			table.insert(report.warnings, item.label .. " lives in CoreGui, which isn't saved with the place, so Eclipse can't keep it. Skipped (use an Eclipse screen effect instead).")
+			for _, marker in ipairs(item.markers) do
+				table.insert(moon.orphanMarkers, marker)
+			end
+			continue
+		end
+		if not Catalog.isTimelineObject(object) then
+			table.insert(report.warnings, item.label .. " (" .. object.ClassName .. ") can't be an Eclipse timeline object. Skipped.")
+			for _, marker in ipairs(item.markers) do
+				table.insert(moon.orphanMarkers, marker)
+			end
+			continue
+		end
+		if usedNames[object.Name] then
+			table.insert(report.warnings, item.label .. " has the same name as another animated object; Eclipse needs unique names, so it was skipped. Rename one of them in Studio and convert again.")
+			for _, marker in ipairs(item.markers) do
+				table.insert(moon.orphanMarkers, marker)
+			end
+			continue
+		end
+
+		local entry = { item = item, object = object, tracks = {}, rows = {}, events = newEventTrack() }
+
+		for _, joint in ipairs(item.joints) do
+			local track = buildJointTrack(object, joint, report)
+			if track then
+				table.insert(entry.tracks, track)
+				for _, key in ipairs(track.keys) do
+					noteFrame(key.frame)
+				end
+			end
+		end
+
+		for _, property in ipairs(item.properties) do
+			if #property.keys > 0 then
+				noteFrame(property.keys[#property.keys].frame)
+			end
+			if ACTION_NAMES[property.name] and convertActions(item, property, entry.events, report) then
+				continue
+			end
+			if item.itemType == "Terrain" and property.name:sub(1, 3) == "MC_" then
+				if #property.keys > 0 then
+					table.insert(report.warnings, item.label .. ": terrain material colour '" .. property.name:sub(4) .. "' can't be animated in Eclipse. Skipped.")
+				end
+				continue
+			end
+			local row, reason = buildPropertyRow(item, property, report)
+			if row then
+				table.insert(entry.rows, row)
+			elseif #property.keys > 0 then
+				table.insert(report.warnings, item.label .. ": '" .. property.name .. "' " .. reason .. ". Skipped.")
+			end
+		end
+
+		for _, marker in ipairs(item.markers) do
+			addMarker(entry.events, marker, report.notes)
+			noteFrame(marker.frame + marker.width)
+		end
+
+		usedNames[object.Name] = true
+		table.insert(entries, entry)
+		primaryEvents = primaryEvents or entry.events
+	end
+
+	local cameraInfo
+	if cameraItem then
+		cameraInfo = cameraEntry(cameraItem, report)
+		cameraInfo.events = newEventTrack()
+		for _, marker in ipairs(cameraItem.markers) do
+			addMarker(cameraInfo.events, marker, report.notes)
+			noteFrame(marker.frame + marker.width)
+		end
+		for _, track in ipairs(cameraInfo.tracks) do
+			for _, key in ipairs(track.keys) do
+				noteFrame(key.frame)
+			end
+		end
+		if #cameraInfo.tracks == 0 and #cameraInfo.events.list == 0 then
+			cameraInfo = nil
+		end
+	end
+
+	-- Events whose object couldn't be converted move to the first object so their code isn't lost
+	if #moon.orphanMarkers > 0 then
+		local target = primaryEvents or (cameraInfo and cameraInfo.events)
+		if target then
+			for _, marker in ipairs(moon.orphanMarkers) do
+				addMarker(target, marker, report.notes)
+				noteFrame(marker.frame + marker.width)
+			end
+			table.insert(report.notes, #moon.orphanMarkers .. " event(s) from skipped objects were moved onto the first object.")
+		else
+			table.insert(report.warnings, #moon.orphanMarkers .. " event(s) were lost because no object could be converted.")
+		end
+	end
+
+	if #entries == 0 and not cameraInfo then
+		table.insert(report.warnings, "Nothing in this save could be converted.")
+		return nil, report
+	end
+
+	-- || Write the project || --
+	local root = ensureFolder(ServerStorage, ECLIPSE_ROOT)
+	local saves = ensureFolder(root, ECLIPSE_SAVES)
+	local projectId = HttpService:GenerateGUID(false)
+	local documentId = HttpService:GenerateGUID(false)
+	local timelineEnd = math.max(1, math.floor(math.max(moon.length, lastFrame)))
+	local settings = {
+		AnimationPriority = priority.Name,
+		FPS = fps,
+		EclipseSkipFrames = 0,
+		EclipsePlaybackStartFrame = 0,
+		EclipseTimelineEnd = timelineEnd,
+	}
+
+	local project = Instance.new("Folder")
+	project.Name = uniqueName(saves, moon.name)
+	for key, value in pairs(settings) do
+		project:SetAttribute(key, value)
+	end
+	project:SetAttribute("Loop", moon.loop)
+	project:SetAttribute("EclipseSave", true)
+	project:SetAttribute("EclipseCompleteSave", true)
+	project:SetAttribute("EclipseLiveProject", true)
+	project:SetAttribute("EclipseProjectId", projectId)
+	project:SetAttribute("EclipseConvertedFromMoon", save:GetFullName())
+
+	local organization = Instance.new("Folder")
+	organization.Name = "EclipseTrackOrganization"
+	organization:SetAttribute("Version", 2)
+	organization:SetAttribute("NextNumber", 1)
+	organization.Parent = project
+
+	local subtitles = Instance.new("Folder")
+	subtitles.Name = "EclipseSubtitles"
+	local subtitleEvents = writeEvents(subtitles, newEventTrack(), fps, true)
+	subtitleEvents:SetAttribute("ProjectSubtitles", true)
+	subtitles:SetAttribute("EclipseEventDocumentId", documentId)
+	subtitles.Parent = project
+
+	local physics = Instance.new("Folder")
+	physics.Name = "EclipsePhysicsSetup"
+	physics.Parent = project
+
+	local rigsFolder = Instance.new("Folder")
+	rigsFolder.Name = "Rigs"
+	rigsFolder.Parent = project
+
+	local function newSequence(entryFolder, scale)
+		local sequence = Instance.new("KeyframeSequence")
+		sequence.Name = "Animation"
+		sequence.Loop = moon.loop
+		sequence.Priority = priority
+		for key, value in pairs(settings) do
+			sequence:SetAttribute(key, value)
+		end
+		sequence:SetAttribute("EclipsePoseSpace", "Canonical")
+		sequence:SetAttribute("EclipseAuthoredScale", scale)
+		sequence:SetAttribute("EclipseProjectId", projectId)
+		sequence:SetAttribute("EclipseProjectComponent", true)
+		sequence:SetAttribute("EclipseHadArmature", false)
+		sequence:SetAttribute("EclipseEventDocumentId", documentId)
+		sequence.Parent = entryFolder
+		return sequence
+	end
+
+	local order = 0
+	for _, entry in ipairs(entries) do
+		order += 1
+		local object = entry.object
+		local folder = Instance.new("Folder")
+		folder.Name = object.Name
+		folder:SetAttribute("RigId", trackId(object))
+		folder:SetAttribute("RigName", object.Name)
+		folder:SetAttribute("RigClass", object.ClassName)
+		folder:SetAttribute("Order", order)
+		local workspacePath = Codec.pathOf(object, workspace)
+		if workspacePath then
+			folder:SetAttribute("RigPath", HttpService:JSONEncode(workspacePath))
+		end
+		local gamePath = Codec.pathOf(object, game)
+		if gamePath then
+			folder:SetAttribute("RigGamePath", HttpService:JSONEncode(gamePath))
+		end
+		local keyCount = 0
+		for _, track in ipairs(entry.tracks) do
+			keyCount += #track.keys
+		end
+		for _, row in ipairs(entry.rows) do
+			for _ in pairs(row.keys or {}) do
+				keyCount += 1
+			end
+		end
+		folder:SetAttribute("EclipseAuthoredKeyCount", keyCount)
+
+		local reference = Instance.new("ObjectValue")
+		reference.Name = "Rig"
+		reference.Value = object
+		reference.Parent = folder
+
+		local sequence = newSequence(folder, object:IsA("Model") and object:GetScale() or 1)
+		if #entry.tracks > 0 then
+			Codec.writeChunks(sequence, "EclipseKeyframeData", Codec.encodeTracks(entry.tracks))
+		end
+		if #entry.rows > 0 then
+			Codec.writeChunks(sequence, "EclipseProperties", Codec.packDocument({ version = 1, tracks = entry.rows, partChoices = {} }))
+		end
+		writeEvents(sequence, entry.events, fps, true)
+		report.events += #entry.events.list
+		folder.Parent = rigsFolder
+		report.objects += 1
+	end
+
+	if cameraInfo then
+		order += 1
+		local name = "Camera"
+		local index = 2
+		while usedNames[name] do
+			name = "Camera " .. index
+			index += 1
+		end
+		local folder = Instance.new("Folder")
+		folder.Name = name
+		folder:SetAttribute("EclipseCamera", true)
+		folder:SetAttribute("CameraRoot", cameraInfo.root)
+		folder:SetAttribute("CameraDefaultFOV", cameraInfo.defaultFov)
+		folder:SetAttribute("CameraProject", project.Name)
+		folder:SetAttribute("CameraIndex", 1)
+		folder:SetAttribute("CameraTrackTarget", false)
+		folder:SetAttribute("CameraHideTarget", false)
+		folder:SetAttribute("CameraOrthographic", false)
+		folder:SetAttribute("RigId", HttpService:GenerateGUID(false))
+		folder:SetAttribute("RigName", name)
+		folder:SetAttribute("RigClass", "Model")
+		folder:SetAttribute("Order", order)
+		local keyCount = 0
+		for _, track in ipairs(cameraInfo.tracks) do
+			keyCount += #track.keys
+		end
+		folder:SetAttribute("EclipseAuthoredKeyCount", keyCount)
+		local reference = Instance.new("ObjectValue")
+		reference.Name = "Rig"
+		reference.Parent = folder
+
+		local sequence = newSequence(folder, 1)
+		if #cameraInfo.tracks > 0 then
+			Codec.writeChunks(sequence, "EclipseKeyframeData", Codec.encodeTracks(cameraInfo.tracks))
+		end
+		Codec.writeChunks(
+			sequence,
+			"EclipseProperties",
+			Codec.packDocument({ version = 1, tracks = {}, partChoices = {}, camera = { CFrame = true, FieldOfView = true } })
+		)
+		writeEvents(sequence, cameraInfo.events, fps, #cameraInfo.events.list > 0)
+		report.events += #cameraInfo.events.list
+		folder.Parent = rigsFolder
+		report.objects += 1
+	end
+
+	project.Parent = saves -- parent last: Eclipse's project list refreshes on ChildAdded
+	report.project = project
+	return project, report
+end
+
+-- ============================================================
+-- Plugin UI
+-- ============================================================
+
+if not plugin then
+	return { Moon = Moon, Codec = Codec, Catalog = Catalog, Converter = Converter }
+end
+
+local toolbar = plugin:CreateToolbar("Moon to Eclipse")
+local openButton = toolbar:CreateButton(
+	"Convert Moon Saves",
+	"Convert Moon Animator 2 saves in ServerStorage into Eclipse Animator projects.",
+	"rbxasset://textures/StudioSharedUI/import.png"
+)
+openButton.ClickableWhenViewportHidden = true
+
+local widget = plugin:CreateDockWidgetPluginGui(
+	"MoonToEclipseConverter",
+	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 420, 480, 320, 320)
+)
+widget.Title = "Moon → Eclipse"
+widget.Name = "MoonToEclipseConverter"
+
+local COLORS = {
+	background = Color3.fromRGB(37, 37, 37),
+	list = Color3.fromRGB(30, 30, 30),
+	row = Color3.fromRGB(46, 46, 46),
+	rowSelected = Color3.fromRGB(44, 72, 110),
+	text = Color3.fromRGB(232, 232, 232),
+	subtext = Color3.fromRGB(160, 160, 160),
+	accent = Color3.fromRGB(0, 122, 230),
+	button = Color3.fromRGB(58, 58, 58),
+	ok = Color3.fromRGB(96, 196, 120),
+	warn = Color3.fromRGB(235, 180, 70),
+}
+
+local function make(className, props)
+	local inst = Instance.new(className)
+	for key, value in pairs(props) do
+		if key ~= "Parent" then
+			inst[key] = value
+		end
+	end
+	inst.Parent = props.Parent
+	return inst
+end
+
+local root = make("Frame", {
+	Size = UDim2.fromScale(1, 1),
+	BackgroundColor3 = COLORS.background,
+	BorderSizePixel = 0,
+	Parent = widget,
+})
+make("UIPadding", {
+	PaddingTop = UDim.new(0, 10),
+	PaddingBottom = UDim.new(0, 10),
+	PaddingLeft = UDim.new(0, 10),
+	PaddingRight = UDim.new(0, 10),
+	Parent = root,
+})
+
+make("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 32),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	TextSize = 12,
+	TextColor3 = COLORS.subtext,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+	Text = "Select Moon Animator 2 saves to convert. Each one becomes a new Eclipse project; your Moon saves stay untouched.",
+	Parent = root,
+})
+
+local STATUS_HEIGHT = 110
+local list = make("ScrollingFrame", {
+	Position = UDim2.new(0, 0, 0, 38),
+	Size = UDim2.new(1, 0, 1, -38 - 42 - STATUS_HEIGHT),
+	BackgroundColor3 = COLORS.list,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 6,
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	CanvasSize = UDim2.new(),
+	Parent = root,
+})
+make("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder, Parent = list })
+make("UIPadding", {
+	PaddingTop = UDim.new(0, 2),
+	PaddingLeft = UDim.new(0, 2),
+	PaddingRight = UDim.new(0, 8),
+	Parent = list,
+})
+
+local buttonBar = make("Frame", {
+	Position = UDim2.new(0, 0, 1, -42 - STATUS_HEIGHT),
+	Size = UDim2.new(1, 0, 0, 42),
+	BackgroundTransparency = 1,
+	Parent = root,
+})
+make("UIListLayout", {
+	FillDirection = Enum.FillDirection.Horizontal,
+	Padding = UDim.new(0, 6),
+	VerticalAlignment = Enum.VerticalAlignment.Center,
+	Parent = buttonBar,
+})
+
+local function makeButton(text, color, width)
+	local button = make("TextButton", {
+		Size = UDim2.new(0, width, 0, 30),
+		BackgroundColor3 = color,
+		BorderSizePixel = 0,
+		AutoButtonColor = true,
+		Font = Enum.Font.GothamBold,
+		TextSize = 13,
+		TextColor3 = Color3.new(1, 1, 1),
+		Text = text,
+		Parent = buttonBar,
+	})
+	make("UICorner", { CornerRadius = UDim.new(0, 4), Parent = button })
+	return button
+end
+
+local convertButton = makeButton("Convert Selected", COLORS.accent, 140)
+local convertAllButton = makeButton("Convert All", COLORS.button, 100)
+local refreshButton = makeButton("Refresh", COLORS.button, 80)
+
+local status = make("TextLabel", {
+	Position = UDim2.new(0, 0, 1, -STATUS_HEIGHT),
+	Size = UDim2.new(1, 0, 0, STATUS_HEIGHT),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	TextSize = 12,
+	TextColor3 = COLORS.subtext,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+	Text = "",
+	Parent = root,
+})
+
+local rows = {}
+
+local function setStatus(text, color)
+	status.Text = text
+	status.TextColor3 = color or COLORS.subtext
+end
+
+local function refreshRow(row)
+	row.frame.BackgroundColor3 = row.selected and COLORS.rowSelected or COLORS.row
+	row.check.Text = row.selected and "☑" or "☐"
+end
+
+local function relativeName(save)
+	local moonRoot = ServerStorage:FindFirstChild(MOON_ROOT)
+	local parts = {}
+	local node = save
+	while node and node ~= moonRoot do
+		table.insert(parts, 1, node.Name)
+		node = node.Parent
+	end
+	return table.concat(parts, " / ")
+end
+
+local function rebuildList(preselect)
+	for _, row in ipairs(rows) do
+		row.frame:Destroy()
+	end
+	table.clear(rows)
+	local saves = Moon.findSaves()
+	for order, save in ipairs(saves) do
+		local frame = make("TextButton", {
+			Size = UDim2.new(1, 0, 0, 40),
+			BackgroundColor3 = COLORS.row,
+			BorderSizePixel = 0,
+			AutoButtonColor = false,
+			Text = "",
+			LayoutOrder = order,
+			Parent = list,
+		})
+		make("UICorner", { CornerRadius = UDim.new(0, 3), Parent = frame })
+		local check = make("TextLabel", {
+			Size = UDim2.new(0, 30, 1, 0),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamBold,
+			TextSize = 18,
+			TextColor3 = COLORS.text,
+			Text = "☐",
+			Parent = frame,
+		})
+		make("TextLabel", {
+			Position = UDim2.new(0, 32, 0, 4),
+			Size = UDim2.new(1, -36, 0, 18),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamMedium,
+			TextSize = 14,
+			TextColor3 = COLORS.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Text = relativeName(save),
+			Parent = frame,
+		})
+		make("TextLabel", {
+			Position = UDim2.new(0, 32, 0, 21),
+			Size = UDim2.new(1, -36, 0, 16),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham,
+			TextSize = 12,
+			TextColor3 = COLORS.subtext,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Text = Moon.summary(save),
+			Parent = frame,
+		})
+		local row = { save = save, selected = preselect ~= nil and preselect[save] == true, frame = frame, check = check }
+		frame.MouseButton1Click:Connect(function()
+			row.selected = not row.selected
+			refreshRow(row)
+		end)
+		refreshRow(row)
+		table.insert(rows, row)
+	end
+	if #saves == 0 then
+		setStatus("No Moon Animator 2 saves found in ServerStorage." .. MOON_ROOT .. ".", COLORS.warn)
+	else
+		setStatus(#saves .. " Moon save(s) found. Click a row to select it.")
+	end
+end
+
+local function convertSaves(saves)
+	if #saves == 0 then
+		setStatus("Select at least one save first.", COLORS.warn)
+		return
+	end
+	local recording = ChangeHistoryService:TryBeginRecording("Convert Moon saves to Eclipse")
+	local lines, created, warningCount = {}, {}, 0
+	for _, save in ipairs(saves) do
+		local ok, project, report = pcall(Converter.convert, save)
+		if not ok then
+			warningCount += 1
+			table.insert(lines, "✗ " .. save.Name .. ": " .. tostring(project))
+			warn("[Moon → Eclipse] " .. save.Name .. " failed: " .. tostring(project))
+			continue
+		end
+		if project then
+			table.insert(created, project)
+			table.insert(
+				lines,
+				string.format("✓ %s → %s (%d objects, %d keys, %d events)", save.Name, project.Name, report.objects, report.keys, report.events)
+			)
+		else
+			table.insert(lines, "✗ " .. save.Name .. ": nothing to convert")
+		end
+		for _, warning in ipairs(report.warnings) do
+			warningCount += 1
+			warn("[Moon → Eclipse] " .. save.Name .. ": " .. warning)
+		end
+		for _, note in ipairs(report.notes) do
+			print("[Moon → Eclipse] " .. save.Name .. ": " .. note)
+		end
+	end
+	if recording then
+		ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
+	end
+	if #created > 0 then
+		Selection:Set(created)
+	end
+	if warningCount > 0 then
+		table.insert(lines, warningCount .. " warning(s): see Output for details.")
+	end
+	table.insert(lines, "Open them from Eclipse › Projects.")
+	setStatus(table.concat(lines, "\n"), warningCount > 0 and COLORS.warn or COLORS.ok)
+end
+
+local function selectedSaves()
+	local saves = {}
+	for _, row in ipairs(rows) do
+		if row.selected and row.save.Parent then
+			table.insert(saves, row.save)
+		end
+	end
+	return saves
+end
+
+convertButton.MouseButton1Click:Connect(function()
+	convertSaves(selectedSaves())
+end)
+
+convertAllButton.MouseButton1Click:Connect(function()
+	local saves = {}
+	for _, row in ipairs(rows) do
+		if row.save.Parent then
+			table.insert(saves, row.save)
+		end
+	end
+	convertSaves(saves)
+end)
+
+refreshButton.MouseButton1Click:Connect(function()
+	rebuildList()
+end)
+
+openButton.Click:Connect(function()
+	if widget.Enabled then
+		widget.Enabled = false
+		return
+	end
+	-- Saves selected in the Explorer start out ticked
+	local preselect = {}
+	for _, object in ipairs(Selection:Get()) do
+		if Moon.isSave(object) then
+			preselect[object] = true
+		end
+	end
+	rebuildList(preselect)
+	widget.Enabled = true
+end)
+
+widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+	openButton:SetActive(widget.Enabled)
+end)
+]]></ProtectedString>
+			<bool name="Disabled">false</bool>
+			<token name="RunContext">0</token>
+			<string name="Name">MoonToEclipse</string>
+		</Properties>
+	</Item>
+</roblox>
