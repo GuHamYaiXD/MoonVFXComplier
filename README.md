@@ -1,119 +1,113 @@
 # MoonVFXCompiler (HamVFX)
 
-Plugin สำหรับ Roblox Studio ที่ผมพัฒนาขึ้นเพื่อลดเวลาการพอร์ต Cutscene และ VFX เข้าเกม
-อ่านไฟล์เซฟของ **Moon Animator 2** หรือโปรเจกต์ของ **Eclipse Animator** แล้วแปลงเป็น Script ที่พร้อมใช้งานในเกมได้ภายในปุ่มเดียว
+A Roblox Studio plugin I built to cut down the time it takes to port cutscenes and VFX into a game.
+It reads a **Moon Animator 2** save or an **Eclipse Animator** project and turns it into a script that's ready to use in-game, in one click.
 
-> เวอร์ชันล่าสุด: **v3.4.0** — รองรับ Eclipse Animator แล้ว + มี Plugin แปลงเซฟ Moon → Eclipse (ดูด้านล่าง)
+> Latest version: **v3.4.0** — now supports Eclipse Animator, plus a new Moon → Eclipse save converter (see below)
 
 ---
 
-## ปัญหา
+## The problem
 
-งานหลักของผมในฝั่ง Front-end คือการนำเอฟเฟกต์ที่ทีมเตรียมไว้มาพอร์ตลงในตัวเกม ส่วนใหญ่จะเป็นพวก Cutscene
-ซึ่งเอฟเฟกต์จะทำงานปกติใน Preview ของ Moon Animator 2 แต่ยังใช้ในเกมจริงไม่ได้ ปัญหาที่ผมเจอคือ
+My main front-end job is taking the effects the team has prepared and porting them into the game, mostly cutscenes.
+The effects play fine in Moon Animator 2's preview but can't be used in the real game as they are. The problems I kept running into:
 
-- ต้องเขียน Script รันเอฟเฟกต์ให้ตรงกับจังหวะทีละเฟรมด้วยมือ
-- ต้องเปิด Roblox Studio หลายหน้าต่างพร้อมกัน เพื่อดู Preview และเช็คจังหวะไปพร้อมกัน
-- ใช้เวลาเฉลี่ยประมาณ **4–6 ชั่วโมง** ต่อเอฟเฟกต์ความยาว 30 วินาที – 1 นาที
+- Writing scripts by hand to fire every effect on the right frame
+- Keeping several Roblox Studio windows open at once to watch the preview and check timing side by side
+- Spending around **4–6 hours** on average for a 30-second to 1-minute effect
 
-## วิธีแก้
+## The solution
 
-ผมจึงพัฒนา Plugin สำหรับ Roblox Studio ที่ใช้ร่วมกับ Moon Animator 2 (Plugin ยอดนิยมสำหรับทำ Animation)
-และตอนนี้รองรับ Eclipse Animator ด้วย
+So I built a Roblox Studio plugin that works alongside Moon Animator 2 (a popular animation plugin),
+and it now supports Eclipse Animator as well.
 
-VFXCompiler จะอ่านไฟล์เซฟของ Animator แล้วแปลงออกมาเป็น Model + ModuleScript `VFXPlayer` ที่พร้อมใช้งาน **ภายในปุ่มเดียว**
+VFXCompiler reads the animator's save and turns it into a Model plus a ready-to-use `VFXPlayer` ModuleScript, **in one click**.
 
-## การทำงาน
+## How it works
 
-1. **อ่านไฟล์เซฟ** — ดึงข้อมูลจากไฟล์เซฟของ Moon Animator 2 (หรือโปรเจกต์ Eclipse) ว่าในแต่ละ Keyframe
-   มี Object และ Event อะไรบ้าง อยู่ที่เวลาไหน และเปลี่ยน Properties อะไรบ้าง พร้อม Easing ของแต่ละช่วง
-2. **เก็บเฉพาะสิ่งที่ถูกแอนิเมตจริง** — แปลงเฟรมเป็นวินาที (`frame / FPS`) เก็บเฉพาะ Property ที่มี Keyframe
-   ลงใน Table ข้อมูลจึงเล็กและไม่ซ้ำซ้อน และทำให้ CFrame อ้างอิงจาก RootPart ของตัวละคร (เล่นตามตัวผู้เล่นได้)
-3. **จัดเรียง Timeline** — เรียง Event ตามเวลาที่เซฟไว้ เช่น "ณ เวลา X มีการ Emit ของ Particle"
-   แล้วแปลงเป็น `task.delay(เวลา, function() ... end)` (โค้ดใน Event ที่อ้าง `workspace.` จะถูกเปลี่ยนไปชี้ที่ Model ที่ Clone ออกมา)
-4. **สร้าง VFXPlayer** — นำ Timeline ของแต่ละ Property ใส่ในฟังก์ชัน
-   `playKeyframes(Object, Property, PropertyType, TimelineTable)` แล้วรวมเป็น Module `VFXPlayer`
-5. **รวม Object ทั้งหมดไว้ใน Group เดียว** — Clone ทุก Object ที่ Script ต้องใช้ (Part, Beam, ParticleEmitter, Rig, CameraRig ฯลฯ)
-   มาไว้ใน Model `<ชื่อเซฟ>_VFX` พร้อมใช้งานทันที
+1. **Read the save** — Pull out of the Moon Animator 2 save (or Eclipse project) which objects and events exist at each keyframe,
+   at what time, which properties change, and the easing of each segment.
+2. **Keep only what's actually animated** — Convert frames to seconds (`frame / FPS`) and store only properties that have keyframes
+   in a table, so the data stays small with no duplication. CFrames are made relative to the character's RootPart, so the effect plays wherever the player is.
+3. **Build the timeline** — Sort events by their saved time, e.g. "at time X, emit this particle",
+   and turn them into `task.delay(time, function() ... end)`. Event code that references `workspace.` is remapped to the cloned model.
+4. **Generate the VFXPlayer** — Put each property's timeline into
+   `playKeyframes(Object, Property, PropertyType, TimelineTable)` and combine everything into the `VFXPlayer` module.
+5. **Group every object together** — Clone every object the script needs (Parts, Beams, ParticleEmitters, rigs, camera rigs, etc.)
+   into one `<SaveName>_VFX` model, ready to use right away.
 
-## รองรับอะไรบ้าง
+## What it supports
 
-- BasePart, Beam, ParticleEmitter, Trail, Light และ Property ทั่วไปที่ Tween ได้
-- Lighting / CameraEffect (ColorCorrection, Atmosphere ฯลฯ) — คืนค่าเดิมให้อัตโนมัติเมื่อเอฟเฟกต์จบ
-- กล้อง: FieldOfView และ Cutscene ผ่าน CameraRig (กล้องจะตาม `CamPart`)
-- Rig ตัวละคร (Humanoid / AnimationController) — ใส่ Animation ID แล้วเล่นอัตโนมัติ
+- BaseParts, Beams, ParticleEmitters, Trails, Lights, and any other tweenable property
+- Lighting / camera effects (ColorCorrection, Atmosphere, etc.) — original values are restored automatically when the effect ends
+- Camera: FieldOfView, and cutscenes through a CameraRig (the camera follows `CamPart`)
+- Character rigs (Humanoid / AnimationController) — add the animation ID and it plays automatically
 - Vignette / Screen Cover UI
-- โค้ดใน Event ของ Moon (`codeBegin` / `codeEnd`) และ Eclipse (`CodeBegin` / `CodeEnd`, Emit ของ VFX, เสียง)
-- โหมด **No Cutscene** สำหรับเอฟเฟกต์ที่เล่นในโลกอย่างเดียว (ไม่ยุ่งกับกล้อง / Lighting / UI)
+- Event code from Moon (`codeBegin` / `codeEnd`) and Eclipse (`CodeBegin` / `CodeEnd`, VFX emits, sounds)
+- **No Cutscene** mode for world-only effects (leaves the camera, Lighting and UI alone)
 
 ---
 
-## ใหม่ใน v3.4.0: Eclipse Animator
+## New in v3.4.0: Eclipse Animator
 
-**1. VFXCompiler อ่านโปรเจกต์ Eclipse ได้แล้ว**
-เลือกโฟลเดอร์โปรเจกต์ใน `ServerStorage › Eclipse Animator Saves › EclipseAnimator_Saves` (หรืออะไรก็ได้ที่อยู่ข้างใน) แล้วกด Generate VFX เหมือนเดิม
-ผลลัพธ์จากโปรเจกต์ Eclipse ที่แปลงมาจากเซฟ Moon ได้ `VFXPlayer` ตรงกับของ Moon ทุกบรรทัด
+**1. VFXCompiler now reads Eclipse projects**
+Select a project folder in `ServerStorage › Eclipse Animator Saves › EclipseAnimator_Saves` (or anything inside it) and press Generate VFX as usual.
+An Eclipse project converted from a Moon save produces a `VFXPlayer` identical, line for line, to the one from the Moon save.
 
-- กล้องของ Eclipse เป็น Rig อยู่แล้ว จึงใช้เป็น CameraRig ได้ทันที (เปิดโปรเจกต์ใน Eclipse หนึ่งครั้งเพื่อให้ Eclipse สร้างกล้อง แล้ว Export / Upload Animation ของกล้องเหมือน CameraRig ของ Moon)
-- Event แบบ Emit และเสียงของ Eclipse จะถูกแปลงเป็นโค้ดใน Timeline
+- Eclipse's camera is already a rig, so it works as a CameraRig straight away (open the project in Eclipse once so Eclipse builds the camera, then export and upload the camera animation, just like a Moon CameraRig)
+- Eclipse's emit and sound events are turned into code on the timeline
 
-**2. Plugin ใหม่: Moon → Eclipse (`MoonToEclipse.rbxmx`)**
-Eclipse เปิดเซฟของ Moon Animator 2 ไม่ได้ Plugin นี้จึงแปลงเซฟ Moon ให้เป็นโปรเจกต์ Eclipse โดยตรง:
+**2. New plugin: Moon → Eclipse (`MoonToEclipse.rbxmx`)**
+Eclipse can't open Moon Animator 2 saves, so this plugin converts a Moon save directly into an Eclipse project:
 
-- ข้อต่อของ Rig ทุก Keyframe (ท่าทางตรงกับ Moon ทุกเฟรม) พร้อม Easing ครบ (รวมค่า Back / Elastic)
-- Property ของ Part / Model / Lighting / Effect, กล้อง (CFrame + FOV)
-- Marker / Event พร้อมโค้ด `codeBegin` / `codeEnd`, เสียง และ Action Track (เช่น Emit)
-- ไม่แก้ไขเซฟ Moon เดิม และ Undo ได้ (Ctrl+Z)
+- Every rig joint keyframe (poses match Moon on every frame), with full easing (including Back / Elastic settings)
+- Part / Model / Lighting / effect properties, and the camera (CFrame + FOV)
+- Markers / events with their `codeBegin` / `codeEnd` code, sounds, and action tracks (such as Emit)
+- Never edits the original Moon save, and can be undone (Ctrl+Z)
 
-ข้อจำกัด: Object ที่อยู่ใน CoreGui (เช่น Vignette แบบเก่า) จะถูกข้ามเพราะไม่ถูกเซฟกับ Place,
-และ Object สองตัวที่ชื่อซ้ำกันจะใส่ในโปรเจกต์เดียวกันไม่ได้ (Eclipse บังคับให้ชื่อไม่ซ้ำ) — Plugin จะแจ้งเตือนใน Output
+Limitations: objects in CoreGui (such as the old-style vignette) are skipped because they aren't saved with the place,
+and two objects with the same name can't go in the same project (Eclipse requires unique names). The plugin warns about both in the Output window.
 
 ---
 
-## การติดตั้ง
+## Installation
 
-1. ดาวน์โหลด `VFXComplier.rbxmx` (และ `MoonToEclipse.rbxmx` ถ้าต้องการตัวแปลง)
-2. วางไฟล์ไว้ในโฟลเดอร์ Plugins ของ Roblox Studio
+1. Download `VFXComplier.rbxmx` (and `MoonToEclipse.rbxmx` if you want the converter)
+2. Put the files in Roblox Studio's Plugins folder
    - Windows: `%LOCALAPPDATA%\Roblox\Plugins`
    - macOS: `~/Documents/Roblox/Plugins`
-   (หรือใน Studio: แท็บ Plugins › Plugins Folder)
-3. ปิดแล้วเปิด Roblox Studio ใหม่
+   (or in Studio: Plugins tab › Plugins Folder)
+3. Restart Roblox Studio
 
-## วิธีใช้
+## Usage
 
-1. กด **Settings** แล้วตั้ง Path ของ Module `ForgeVFX` และโฟลเดอร์ที่ใช้เก็บ VFX (ค่าเริ่มต้น `ReplicatedStorage.ForgeVFX` / `ReplicatedStorage.VFX`)
-2. กด **Get Module** หนึ่งครั้ง เพื่อติดตั้ง `Payload` (`VFXPayload` + ตัวเรียก `VFX`) ไว้ข้าง ForgeVFX
-3. เลือกเซฟ Moon Animator 2 (`ServerStorage.MoonAnimator2Saves`) หรือโปรเจกต์ Eclipse
-4. กด **Generate VFX** (หรือ **Generate VFX (No Cutscene)**) จะได้ Model `<ชื่อ>_VFX` ใน Workspace
-5. ใส่ Animation ID ของ Rig / CameraRig ใน `module.Animations` ของ `VFXPlayer` แล้วย้าย Model ไปไว้ในโฟลเดอร์ VFX
+1. Press **Settings** and set the path of your `ForgeVFX` module and the folder your VFX are stored in (defaults: `ReplicatedStorage.ForgeVFX` / `ReplicatedStorage.VFX`)
+2. Press **Get Module** once to install `Payload` (`VFXPayload` + the `VFX` caller) next to ForgeVFX
+3. Select a Moon Animator 2 save (`ServerStorage.MoonAnimator2Saves`) or an Eclipse project
+4. Press **Generate VFX** (or **Generate VFX (No Cutscene)**) to get a `<Name>_VFX` model in Workspace
+5. Fill in the rig / camera rig animation IDs in the `VFXPlayer`'s `module.Animations`, then move the model into your VFX folder
 
-เรียกใช้ในเกม (ฝั่ง Client):
+Playing it in-game (client side):
 
 ```lua
 local VFX = require(game.ReplicatedStorage.Payload.VFX)
 
--- VFX.Play(ชื่อหรือ Model, rootPart, offset, lifeTime, config)
+-- VFX.Play(name or model, rootPart, offset, lifeTime, config)
 VFX.Play("Slash", character.HumanoidRootPart, CFrame.new(), 5, {
-	PlayCutscene = true,       -- ค่าเริ่มต้น true
-	AutoPlayAnimations = true, -- ค่าเริ่มต้น true
+	PlayCutscene = true,       -- defaults to true
+	AutoPlayAnimations = true, -- defaults to true
 })
 ```
 
-แปลงเซฟ Moon → Eclipse: แถบเครื่องมือ **Moon to Eclipse › Convert Moon Saves** › เลือกเซฟ › **Convert Selected** / **Convert All**
-แล้วเปิดโปรเจกต์ได้ที่ Eclipse › Projects
+Converting Moon → Eclipse: **Moon to Eclipse** toolbar › **Convert Moon Saves** › pick saves › **Convert Selected** / **Convert All**,
+then open the project from Eclipse › Projects.
 
-## โครงสร้างไฟล์
+## Files
 
-| ไฟล์ | คืออะไร |
+| File | What it is |
 |---|---|
-| `VFXComplier.rbxmx` | ไฟล์ Plugin VFXCompiler (HamVFX v3.4.0) พร้อมติดตั้ง |
-| `VFXComplier/` | Source ของ Plugin (`init.server.luau`) + UI ของ Vignette / Screen Cover |
-| `MoonToEclipse.rbxmx` | ไฟล์ Plugin แปลงเซฟ Moon → Eclipse พร้อมติดตั้ง |
-| `MoonToEclipse/` | Source ของตัวแปลง |
-| `exampleGenerated.lua` | ตัวอย่าง `VFXPlayer` ที่ Generate ออกมา (จากเวอร์ชันก่อน) |
-
----
-
-### English summary
-
-A one-button Roblox Studio plugin that turns a **Moon Animator 2** save or an **Eclipse Animator** project into a ready-to-use VFX model plus a `VFXPlayer` ModuleScript: property tweens with matching easing, event code scheduled on a timeline, character/camera rigs and cutscene camera, all grouped into one model. Cut porting a 30–60 s cutscene effect from 4–6 hours of hand-timed scripting to one click. v3.4.0 adds Eclipse Animator support and a companion **Moon → Eclipse** converter plugin that rewrites Moon saves as Eclipse projects (joints, properties, camera, easing, events).
+| `VFXComplier.rbxmx` | The VFXCompiler plugin (HamVFX v3.4.0), ready to install |
+| `VFXComplier/` | Plugin source (`init.server.luau`) + the Vignette / Screen Cover UI |
+| `MoonToEclipse.rbxmx` | The Moon → Eclipse converter plugin, ready to install |
+| `MoonToEclipse/` | Converter source |
+| `exampleGenerated.lua` | An example generated `VFXPlayer` (from an earlier version) |
